@@ -8,7 +8,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api/vlm': {
-        target: process.env.VITE_VLM_PROXY_URL || 'http://127.0.0.1:8788',
+        target: 'http://127.0.0.1:8788',
         changeOrigin: true,
       },
     },

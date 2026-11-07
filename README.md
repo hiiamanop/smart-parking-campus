@@ -1,87 +1,131 @@
 # Smart Parking Campus
 
-Proyek **Smart Parking** untuk mengatasi masalah parkir di kampus (lapangan *outdoor*, banyak fakultas/zona): pengguna sudah melihat *counter* ketersediaan, tetapi belum tahu **lokasi/area kosong** dan ingin parkir di **zona dekat fakultasnya**.
+Web app **Smart Parking** untuk kampus: booking slot dari rumah, QR sesi, gate masuk/keluar, pembayaran di aplikasi, dan verifikasi plat nomor dengan **VLM (OpenRouter)**. Berjalan sebagai **PWA** sehingga bisa dipasang sebagai shortcut/aplikasi dari browser.
 
-MVP berfokus pada **booking online** berbasis zona dengan alur QR di gate/zona, pembayaran di aplikasi (bukan di gate), serta **AI (VLM)** untuk pembacaan/verifikasi **plat nomor** di gate masuk dan gate keluar.
+Database memakai **Supabase self-hosted** yang sudah ada di workspace `storage` (schema `public`, tabel ber-prefix `parking_`).
 
-## Status
-- Tahap: **Fondasi awal dikerjakan** (docs + scaffold web + proxy VLM OpenRouter).
-- Platform: **web-based saja** (responsive). Pengguna dapat **mengunduh/menambah shortcut aplikasi** dari web (installable/PWA, *Add to Home Screen*).
-- VLM (otak AI): **OpenRouter**. Model default: `google/gemini-2.5-flash` (cepat, vision/OCR kuat untuk MVP). Bisa diganti di `.env`.
+## Arsitektur
 
-## Struktur
 ```text
-smart-parking/
-├── .env                 # konfigurasi lokal (ISI API key; jangan commit)
-├── .env.example         # template env
-├── .gitignore
-├── README.md
-├── docs/
-│   ├── user-story.md
-│   ├── backlog.md
-│   └── brd.md
-├── server/              # proxy lokal OpenRouter VLM (API key tetap di server)
-│   ├── package.json
-│   └── server.mjs
-└── app/                 # web app (Vite + React + TS, PWA)
-    ├── public/          # manifest, icon, service worker
-    └── src/
-        └── lib/vlm.ts   # client ke proxy /api/vlm/plate
+Browser (PWA)
+   │  same-origin
+   ▼
+smart-parking-web (Node, container)  ── /api/db/rpc/* ──► Supabase PostgREST (api-gw:8000)
+   │                                  └─ /api/vlm/plate ─► OpenRouter (VLM)
+   │
+   ▼
+Cloudflare Tunnel ── parkir.hiiamanop.my.id
 ```
 
-## Setup cepat
-1. Isi API key OpenRouter:
-   ```bash
-   # edit file .env
-   OPENROUTER_API_KEY=isi_key_openrouter_anda
-   OPENROUTER_VLM_MODEL=google/gemini-2.5-flash
+- **Kunci Supabase & OpenRouter hanya ada di server** (`.env`), tidak dikirim ke browser.
+- Browser memanggil `/api/db/rpc/<fungsi>` (proxy) dan `/api/vlm/plate`; keduanya ditangani server yang sama dengan file statis `app/dist`.
+- Tabel dikunci RLS; aplikasi hanya memakai fungsi RPC `SECURITY DEFINER` (lihat `supabase/schema.sql`).
+
+## Struktur
+
+```text
+smart-parking/
+├── Dockerfile
+├── docker-compose.yml        # service web, join network supabase_default
+├── .env                      # rahasia lokal (gitignored)
+├── .env.example
+├── app/                      # Vite + React + TS (PWA)
+│   ├── public/               # manifest, ikon, service worker
+│   ├── scripts/              # generator ikon PNG
+│   └── src/
+│       ├── components/       # QrCode, QrScanner, PlateReader, VlmTester
+│       ├── lib/              # api, format, vlm
+│       └── App.tsx
+├── server/server.mjs         # static server + proxy DB + proxy VLM
+├── supabase/schema.sql       # tabel, RPC, RLS, seed zona
+└── docs/                     # user story, backlog, BRD
+```
+
+## Setup
+
+1. Isi `.env` (contoh lengkap di `.env.example`):
+
+   ```env
+   OPENROUTER_API_KEY=sk-or-...
+   OPENROUTER_VLM_MODEL=google/gemini-3.5-flash
+
+   # Supabase self-hosted (server-side)
+   SUPABASE_URL=http://127.0.0.1:8000
+   SUPABASE_KEY=sb_publishable_...
    ```
-   Template lengkap: `.env.example`. **Jangan commit `.env`.**
 
-2. Jalankan proxy VLM (terminal 1):
+   `SUPABASE_KEY` boleh memakai *publishable key* atau *anon key* dari workspace `storage`.
+
+2. Terapkan schema database (sekali / saat ada perubahan):
+
    ```bash
-   cd smart-parking/server
-   node server.mjs
-   # cek: http://127.0.0.1:8788/health
+   docker exec -i supabase-db psql -U postgres -d postgres < supabase/schema.sql
    ```
 
-3. Jalankan web app (terminal 2):
+3. Jalankan secara lokal (tanpa Docker):
+
    ```bash
-   cd smart-parking/app
-   npm install
-   npm run dev
-   # buka: http://localhost:5173
+   cd app && npm install && npm run build
+   cd .. && node server/server.mjs
+   # buka http://127.0.0.1:8788  (health: /health)
    ```
 
-4. Uji VLM: di web app, upload foto plat/kendaraan → “Baca plat (VLM)”. Proxy meneruskan gambar ke OpenRouter (model dari `.env`) dan mengembalikan JSON (`plate`, `confidence`, dll.).
+   Mode pengembangan UI: `cd app && npm run dev` (proxy Vite meneruskan `/api/vlm` ke `127.0.0.1:8788`).
+   Catatan: proxy DB di `server/server.mjs` juga menangani `/api/db/*`, jadi untuk dev penuh jalankan server + Vite.
 
-## Model VLM (OpenRouter)
-Default dipilih untuk MVP gate/plat: **`google/gemini-2.5-flash`** — keseimbangan akurasi vision/OCR, latensi, dan biaya; mudah diganti.
+4. Deploy di PC (Docker):
 
-Alternatif (ubah `OPENROUTER_VLM_MODEL` di `.env`):
-- `google/gemini-2.5-pro` — lebih kuat, biasanya lebih mahal/lambat.
-- `google/gemini-3-flash-preview` — lebih baru (preview; ketersediaan/ID bisa berubah).
-- `qwen/qwen3-vl-235b-a22b-instruct` — VLM kuat, klaim OCR multibahasa.
-- `anthropic/claude-sonnet-4.6` — vision kuat, biaya lebih tinggi.
-- `openai/gpt-4o` — vision umum kuat.
+   ```bash
+   docker compose up -d --build
+   curl http://127.0.0.1:8788/health
+   ```
 
-> Catatan: “terbaik” tergantung akurasi plat Indonesia outdoor, latensi gate, dan biaya. Validasi dengan dataset/foto nyata (siang/malam/hujan/sudut miring) sebelum produksi; sediakan fallback manual/petugas (lihat backlog E10-S4, E3-S6).
+   Container `smart-parking-web` join network `supabase_default` sehingga dapat mengakses `http://api-gw:8000` tanpa lewat Cloudflare/CORS.
 
-## Ringkasan alur MVP
-1. Booking dari rumah (fakultas, zona, ETA, ETD) → dapat **QR/barcode sesi**.
-2. **Gate masuk**: scan QR/barcode sesi + **VLM baca plat** (sesi terkunci ke plat) → palang terbuka. *Telat > 10 menit dari ETA → booking hangus, slot terbuka* (kebijakan).
-3. **Zona**: scan **QR zona** → konfirmasi sudah parkir.
-4. **Zona (mau pulang)**: scan **QR zona** → mulai checkout → **bill**.
-5. **Bayar di app** (bukan di gate): normal **Rp2.000**; overstay → **violation** + **Rp2.000 + Rp1.000** (kebijakan).
-6. Lunas → dapat **QR/barcode keluar**.
-7. **Gate keluar**: **VLM verifikasi plat** cocok + scan QR/barcode keluar → palang terbuka.
+## Domain & Cloudflare Tunnel
+
+Ingress tunnel ada di workspace storage: `storage/volumes/cloudflared/config.yml`.
+
+```yaml
+ingress:
+  - hostname: storage.hiiamanop.my.id
+    service: http://api-gw:8000
+  - hostname: parkir.hiiamanop.my.id
+    service: http://smart-parking-web:8788
+  - service: http_status:404
+```
+
+Setelah mengubah config: `cd storage && docker compose restart cloudflared`.
+
+DNS yang dibutuhkan di Cloudflare (zone `hiiamanop.my.id`):
+
+| Type  | Name    | Target                                     | Proxy |
+|-------|---------|--------------------------------------------|-------|
+| CNAME | `parkir`| `efa3575e-ce9a-400c-ab75-c9edb521479e.cfargotunnel.com` | Proxied |
+
+Buat lewat dashboard Cloudflare **DNS → Records → Add record**, atau dengan API token yang punya izin **Zone → DNS → Edit**.
+
+## Alur MVP
+
+1. **Booking** dari rumah: pilih zona/fakultas, isi plat, ETA, ETD → dapat **QR sesi** (`SP...`).
+2. **Gate masuk**: scan QR sesi + foto plat (VLM) → plat harus cocok → sesi `active`, palang terbuka.
+   Telat > 10 menit dari ETA → booking `expired`, slot dibuka.
+3. **Zona**: scan QR zona (`ZONE-...`) → konfirmasi terparkir.
+4. **Checkout**: scan QR zona lagi → bill dihitung.
+5. **Bayar** di aplikasi (simulasi QRIS): normal **Rp2.000**; overstay (ETD + 10 menit) → **violation + Rp1.000**, total **Rp3.000**.
+6. **Gate keluar**: scan QR keluar (`EX...`) + foto plat (VLM) → plat harus sama dengan yang dikunci saat masuk → sesi `closed`.
+7. **Loyalty**: sesi bersih +2 poin; overstay −1 poin (minimal 0).
+
+## Status & batasan MVP
+
+- Pembayaran masih **simulasi** (belum terhubung QRIS gateway).
+- Gate/palang masih **simulasi** (belum ada kontroler perangkat keras).
+- Scan QR memakai `BarcodeDetector` (Chrome Android); browser lain memakai input kode manual.
+- Belum ada login pengguna; riwayat sesi diikat ke **device id** acak di browser.
+- Fungsi RPC dapat dipanggil siapa pun yang tahu endpoint publik; kode sesi bersifat rahasia/unggues. Untuk produksi perlu auth + rate limiting.
 
 ## Dokumen
-- [User Story Lengkap](docs/user-story.md)
-- [Product Backlog Lengkap](docs/backlog.md)
-- [BRD — Business Requirements Document](docs/brd.md)
 
-## Catatan penting
-- `.env` berisi `OPENROUTER_API_KEY` — jangan commit/publish. Panggilan OpenRouter dilakukan lewat **`server/` proxy**, bukan dari browser.
-- Integrasi Supabase, gate controller, kamera, dan payment gateway belum diimplementasi (lihat backlog).
-- Hukuman fisik otomatis berisiko; MVP mengutamakan validasi sistem, verifikasi plat, audit, dan konsekuensi kebijakan yang aman.
+- [User Story](docs/user-story.md)
+- [Product Backlog](docs/backlog.md)
+- [BRD](docs/brd.md)

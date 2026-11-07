@@ -1,0 +1,14 @@
+{
+  "name": "smart-parking-kampus",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Smart Parking Kampus - booking, QR gate, VLM plat, PWA.",
+  "scripts": {
+    "build": "npm --prefix app run build",
+    "dev": "npm --prefix app run dev",
+    "dev:server": "node server/server.mjs",
+    "icons": "node app/scripts/make-icons.mjs",
+    "db:apply": "docker exec -i supabase-db psql -U postgres -d postgres < supabase/schema.sql",
+    "deploy": "npm run build && docker compose up -d --build"
+  }
+}

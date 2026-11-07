@@ -1,0 +1,9 @@
+.git
+.env
+**/node_modules
+app/src
+app/public
+docs
+Dockerfile
+docker-compose.yml
+README.md
