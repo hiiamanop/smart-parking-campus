@@ -581,7 +581,8 @@ export function App() {
 
       <footer>
         <small>
-          Database: Supabase self-hosted (storage) · VLM: OpenRouter · Web/PWA.
+          Database: Supabase self-hosted (storage) · VLM: OpenRouter · Web/PWA · <strong>v0.2.0</strong>
+          <br />
           Data sesi disimpan per perangkat ini.
         </small>
       </footer>
