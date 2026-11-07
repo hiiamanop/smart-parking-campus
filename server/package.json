@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "node --watch server.mjs",
     "start": "node server.mjs",
-    "test": "node test-store.mjs"
+    "test:store": "REDIS_URL=redis://127.0.0.1:6379/15 ALLOW_TEST_FLUSH=1 node test-store.mjs",
+    "test:api": "node test-runner.mjs",
+    "test": "npm run test:store && node test-consensus.mjs && npm run test:api"
   },
   "dependencies": {
     "ioredis": "^6.0.0"

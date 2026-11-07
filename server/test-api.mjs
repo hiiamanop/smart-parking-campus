@@ -1,12 +1,29 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 
-const BASE = 'http://127.0.0.1:8788';
+const BASE = process.env.API_BASE || 'http://127.0.0.1:8788';
+const ADMIN_TOKEN = process.env.ADMIN_API_TOKEN || '';
+const GATE_TOKEN = process.env.GATE_API_TOKEN || '';
+
+function authHeader(path) {
+  if (path.startsWith('/api/gates/') || path.startsWith('/api/vlm/')) {
+    return GATE_TOKEN ? { Authorization: `Bearer ${GATE_TOKEN}` } : {};
+  }
+  if (path.startsWith('/api/admin/')) {
+    return ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
+  }
+  if (path.startsWith('/api/domains') || path.startsWith('/api/zones')) {
+    // Zone/domain CRUD is admin-only; driver scan stays public
+    if (path === '/api/zones/scan') return {};
+    return ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
+  }
+  return {};
+}
 
 async function request(path, options = {}) {
   const url = `${BASE}${path}`;
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: { 'Content-Type': 'application/json', ...authHeader(path), ...options.headers },
     ...options,
   });
   const data = await res.json();
@@ -40,7 +57,7 @@ async function runApiTest() {
       zoneId: targetZone.id,
       userName: 'Api Tester',
       vehicleType: 'motorcycle',
-      eta: '10:00',
+      eta: Date.now() + 30 * 60 * 1000,
       etd: '18:00',
     }),
   });
@@ -72,14 +89,10 @@ async function runApiTest() {
   assert.equal(confirmRes.status, 200);
   assert.equal(confirmRes.data.session.status, 'PARKED_CONFIRMED');
 
-  // 6. Zone checkout
-  const checkoutRes = await request('/api/zones/scan', {
+  // 6. Checkout from the app (no zone QR scan needed)
+  const checkoutRes = await request('/api/payments/checkout', {
     method: 'POST',
-    body: JSON.stringify({
-      sessionCode: session.sessionCode,
-      scannedZoneId: targetZone.id,
-      action: 'checkout',
-    }),
+    body: JSON.stringify({ sessionCode: session.sessionCode }),
   });
   assert.equal(checkoutRes.status, 200);
   assert.equal(checkoutRes.data.session.status, 'CHECKOUT_REQUESTED');
@@ -109,6 +122,89 @@ async function runApiTest() {
   assert.equal(exitRes.status, 200);
   assert.equal(exitRes.data.gateOpened, true);
   assert.equal(exitRes.data.session.status, 'COMPLETED');
+
+  // 9. Cancel booking releases the slot
+  const cancelBook = await request('/api/bookings', {
+    method: 'POST',
+    body: JSON.stringify({
+      domainId: targetZone.domainId,
+      zoneId: targetZone.id,
+      userName: 'Cancel Tester',
+      vehicleType: 'motorcycle',
+      eta: Date.now() + 30 * 60 * 1000,
+    }),
+  });
+  assert.equal(cancelBook.status, 201);
+  const cancelRes = await request('/api/bookings/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ sessionCode: cancelBook.data.session.sessionCode }),
+  });
+  assert.equal(cancelRes.status, 200);
+  assert.equal(cancelRes.data.session.status, 'CANCELLED');
+
+  // 10. Change zone before entry
+  const altZone = zonesRes.data.zones.find(
+    (z) => z.id !== targetZone.id && !z.isFull && (z.vehicleType || 'motorcycle') === 'motorcycle'
+  );
+  if (altZone) {
+    const moveBook = await request('/api/bookings', {
+      method: 'POST',
+      body: JSON.stringify({
+        domainId: targetZone.domainId,
+        zoneId: targetZone.id,
+        userName: 'Move Tester',
+        vehicleType: 'motorcycle',
+        eta: Date.now() + 30 * 60 * 1000,
+      }),
+    });
+    assert.equal(moveBook.status, 201);
+    const moveRes = await request('/api/bookings/change-zone', {
+      method: 'POST',
+      body: JSON.stringify({ sessionCode: moveBook.data.session.sessionCode, zoneId: altZone.id }),
+    });
+    assert.equal(moveRes.status, 200);
+    assert.equal(moveRes.data.session.zoneId, altZone.id);
+    await request('/api/bookings/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ sessionCode: moveBook.data.session.sessionCode }),
+    });
+  }
+
+  // 11. Zone with an active session cannot be deleted
+  const newZone = await request('/api/zones', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Zona Guard',
+      domainId: targetZone.domainId,
+      vehicleType: 'motorcycle',
+      capacity: 2,
+    }),
+  });
+  assert.equal(newZone.status, 201);
+  const guardZoneId = newZone.data.zone.id;
+
+  const guardBook = await request('/api/bookings', {
+    method: 'POST',
+    body: JSON.stringify({
+      domainId: targetZone.domainId,
+      zoneId: guardZoneId,
+      userName: 'Guard Tester',
+      vehicleType: 'motorcycle',
+      eta: Date.now() + 30 * 60 * 1000,
+    }),
+  });
+  assert.equal(guardBook.status, 201);
+
+  const blockedDelete = await request(`/api/zones/${guardZoneId}`, { method: 'DELETE' });
+  assert.equal(blockedDelete.status, 400);
+  assert.match(String(blockedDelete.data.error), /sesi aktif/i);
+
+  await request('/api/bookings/cancel', {
+    method: 'POST',
+    body: JSON.stringify({ sessionCode: guardBook.data.session.sessionCode }),
+  });
+  const deleteOk = await request(`/api/zones/${guardZoneId}`, { method: 'DELETE' });
+  assert.equal(deleteOk.status, 200);
 
   console.log('All API endpoints verified successfully!');
 }

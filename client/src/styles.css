@@ -628,3 +628,48 @@ button { font: inherit; }
 @media (max-width: 380px) {
   .ticket-meta { grid-template-columns: 1fr 1fr; }
 }
+
+/* QR expiry notice */
+.expiry-line {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--navy);
+  background: var(--navy-soft);
+  border: 1px solid var(--navy-line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  text-align: center;
+}
+.expiry-line.expired {
+  background: #fdf3f2;
+  border-color: #f0d5d1;
+  color: var(--err);
+}
+.link-action {
+  display: inline-block;
+  margin-left: 6px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+}
+
+/* Change zone */
+.zone-change-box {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 14px;
+  background: var(--paper);
+}
+.zone-change-title {
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+.zone-change-box select { margin-top: 0; }

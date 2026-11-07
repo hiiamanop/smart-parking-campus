@@ -24,3 +24,6 @@ server/.env
 # OS/editor
 .DS_Store
 *.log
+
+# Local history archive
+data/

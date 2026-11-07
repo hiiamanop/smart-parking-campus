@@ -23,12 +23,15 @@ function formatRelative(iso: string | null) {
 
 export function AnalyticsPanel() {
   const [data, setData] = useState<Analytics | null>(null);
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = () => {
     setLoading(true);
-    fetchAnalytics()
+    fetchAnalytics({ from: from || undefined, to: to || undefined })
       .then((res) => {
         setData(res);
         setError(null);
@@ -41,29 +44,73 @@ export function AnalyticsPanel() {
     load();
     const iv = setInterval(load, 20000);
     return () => clearInterval(iv);
-  }, []);
+  }, [from, to]);
+
+  const allZones = data?.zones ?? [];
+  const PAGE_SIZE = 10;
+  const totalPages = Math.max(1, Math.ceil(allZones.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages - 1);
+  const pageZones = allZones.slice(currentPage * PAGE_SIZE, currentPage * PAGE_SIZE + PAGE_SIZE);
 
   const maxHour = Math.max(1, ...(data?.hours.map((h) => h.activity) ?? [1]));
   const maxDay = Math.max(1, ...((data?.finance.daily ?? []).map((d) => d.revenue) || [1]));
 
   return (
     <div className="admin-session-monitor">
-      <div className="section-header row" style={{ justifyContent: 'space-between' }}>
-        <div>
-          <h2>Analitik &amp; perawatan preventif</h2>
-          <p className="hint-text" style={{ margin: 0 }}>
-            Zona dengan aktivitas tertinggi menandakan titik yang paling cepat aus — kamera gate di sana
-            perlu diperiksa lebih sering.
-          </p>
+      <div className="page-toolbar">
+        <div className="row" style={{ gap: 8 }}>
+          <label className="row" style={{ gap: 6 }}>
+            <span className="hint-text" style={{ margin: 0 }}>Dari:</span>
+            <input
+              type="date"
+              value={from}
+              max={to || undefined}
+              onChange={(e) => {
+                setFrom(e.target.value);
+                setPage(0);
+              }}
+              style={{ width: 'auto' }}
+            />
+          </label>
+          <label className="row" style={{ gap: 6 }}>
+            <span className="hint-text" style={{ margin: 0 }}>Sampai:</span>
+            <input
+              type="date"
+              value={to}
+              min={from || undefined}
+              onChange={(e) => {
+                setTo(e.target.value);
+                setPage(0);
+              }}
+              style={{ width: 'auto' }}
+            />
+          </label>
+          {(from || to) && (
+            <button
+              type="button"
+              className="secondary btn-sm"
+              onClick={() => {
+                setFrom('');
+                setTo('');
+                setPage(0);
+              }}
+            >
+              Semua
+            </button>
+          )}
+          <button type="button" className="secondary btn-sm" onClick={load} disabled={loading}>
+            {loading ? 'Memuat…' : 'Segarkan'}
+          </button>
         </div>
-        <button type="button" className="secondary btn-sm" onClick={load} disabled={loading}>
-          {loading ? 'Memuat…' : 'Segarkan'}
-        </button>
       </div>
+
+      <p className="hint-text" style={{ marginTop: -6 }}>
+        Periode: {from || to ? `${from || '…'} sampai ${to || '…'}` : 'semua waktu'} · okupansi selalu menampilkan kondisi saat ini.
+      </p>
 
       {error && <div className="alert alert-err">{error}</div>}
 
-      <div className="grid mb-4">
+      <div className="stat-strip mb-4">
         <div className="card stat-card">
           <small>Total aktivitas</small>
           <strong className="stat-num">{data?.totals.activity ?? 0}</strong>
@@ -115,7 +162,7 @@ export function AnalyticsPanel() {
               </tr>
             </thead>
             <tbody>
-              {(data?.zones ?? []).map((z) => (
+              {pageZones.map((z) => (
                 <tr key={z.zoneId}>
                   <td>
                     <strong>{z.zoneName}</strong>
@@ -141,10 +188,102 @@ export function AnalyticsPanel() {
                   <td>{z.checkIntervalDays} hari</td>
                 </tr>
               ))}
-              {data && data.zones.length === 0 && (
+              {data && allZones.length === 0 && (
                 <tr>
                   <td colSpan={12} className="hint-text" style={{ textAlign: 'center', padding: 18 }}>
                     Belum ada aktivitas tercatat.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {allZones.length > PAGE_SIZE && (
+          <div className="row" style={{ justifyContent: 'space-between', marginTop: 12 }}>
+            <span className="hint-text" style={{ margin: 0 }}>
+              Menampilkan {currentPage * PAGE_SIZE + 1}–
+              {Math.min(allZones.length, (currentPage + 1) * PAGE_SIZE)} dari {allZones.length} zona
+            </span>
+            <div className="row" style={{ gap: 6 }}>
+              <button
+                type="button"
+                className="secondary btn-sm"
+                disabled={currentPage === 0}
+                onClick={() => setPage(currentPage - 1)}
+              >
+                Sebelumnya
+              </button>
+              <span className="hint-text" style={{ margin: 0 }}>
+                {currentPage + 1}/{totalPages}
+              </span>
+              <button
+                type="button"
+                className="secondary btn-sm"
+                disabled={currentPage >= totalPages - 1}
+                onClick={() => setPage(currentPage + 1)}
+              >
+                Berikutnya
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+
+      <section className="card mb-4">
+        <h3>Kualitas kamera gate</h3>
+        <p className="hint-text">
+          Skor dari ketajaman, kecerahan, dan kontras frame kamera. Tren turun 3 sampel terakhir
+          menandakan kamera perlu dibersihkan atau digeser.
+        </p>
+        <div className="table-scroll">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Gate</th>
+                <th>Skor terakhir</th>
+                <th>Rata-rata (EWMA)</th>
+                <th>Rata-rata total</th>
+                <th>Tren</th>
+                <th>Sampel rendah</th>
+                <th>Terakhir</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(data?.gates ?? []).map((g) => (
+                <tr key={g.gateId}>
+                  <td>
+                    <strong>{g.gateId}</strong>
+                  </td>
+                  <td>{g.lastScore}/100</td>
+                  <td>{g.ewma}/100</td>
+                  <td>
+                    {g.average}/100 <small>({g.samples} sampel)</small>
+                  </td>
+                  <td className={g.trend < 0 ? 'err' : 'ok'}>
+                    {g.trend > 0 ? '+' : ''}
+                    {g.trend}
+                  </td>
+                  <td>{g.lowSamples}</td>
+                  <td>
+                    <small>{g.lastAt ? new Date(g.lastAt).toLocaleString('id-ID') : '—'}</small>
+                  </td>
+                  <td>
+                    <span
+                      className={`status-badge ${
+                        g.status === 'baik' ? 'badge-parked' : g.status === 'menurun' ? 'badge-checkout' : 'badge-expired'
+                      }`}
+                    >
+                      {g.status}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+              {data && data.gates.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="hint-text" style={{ textAlign: 'center', padding: 18 }}>
+                    Belum ada sampel kualitas kamera. Buka terminal gate untuk mulai mengirim data.
                   </td>
                 </tr>
               )}
@@ -189,7 +328,7 @@ export function AnalyticsPanel() {
         </div>
 
         <div className="grid">
-          <div className="table-scroll">
+          <div className="table-scroll finance-scroll">
             <table className="admin-table">
               <thead>
                 <tr>
@@ -221,7 +360,7 @@ export function AnalyticsPanel() {
             </table>
           </div>
 
-          <div className="table-scroll">
+          <div className="table-scroll finance-scroll">
             <table className="admin-table">
               <thead>
                 <tr>
@@ -232,7 +371,7 @@ export function AnalyticsPanel() {
                 </tr>
               </thead>
               <tbody>
-                {(data?.finance.byZone ?? []).slice(0, 8).map((z) => (
+                {(data?.finance.byZone ?? []).map((z) => (
                   <tr key={z.zoneId}>
                     <td>
                       <strong>{z.zoneName}</strong>
@@ -257,7 +396,11 @@ export function AnalyticsPanel() {
         <h4 style={{ marginTop: 18 }}>Pendapatan 7 hari terakhir</h4>
         <div className="day-bars">
           {(data?.finance.daily ?? []).map((d) => (
-            <div key={d.date} className="day-bar-item" title={`${d.date} — ${formatRupiah(d.revenue)}`}>
+            <div
+              key={d.date}
+              className="day-bar-item chart-tip"
+              data-tip={`${d.date} — ${formatRupiah(d.revenue)}`}
+            >
               <span className="day-bar-value">{d.revenue > 0 ? `${Math.round(d.revenue / 1000)}k` : ''}</span>
               <div className="day-bar-fill" style={{ height: `${Math.max(3, (d.revenue / maxDay) * 100)}%` }} />
               <span className="day-bar-label">{d.date.slice(5)}</span>
@@ -270,7 +413,7 @@ export function AnalyticsPanel() {
         <section className="card">
           <h3>Aktivitas per domain</h3>
           <p className="hint-text">Domain paling ramai jadi kandidat penambahan CCTV dan pengecekan rutin.</p>
-          <div className="table-scroll">
+          <div className="table-scroll table-scroll-4">
             <table className="admin-table">
               <thead>
                 <tr>
@@ -302,7 +445,7 @@ export function AnalyticsPanel() {
           </div>
         </section>
 
-        <section className="card">
+        <section className="card hour-card">
           <h3>Jam sibuk</h3>
           <p className="hint-text">
             {data && data.peakHours.length > 0
@@ -311,7 +454,11 @@ export function AnalyticsPanel() {
           </p>
           <div className="hour-bars">
             {(data?.hours ?? []).map((h) => (
-              <div key={h.hour} className="hour-bar-item" title={`${h.hour}:00 — ${h.activity} aktivitas`}>
+              <div
+                key={h.hour}
+                className="hour-bar-item chart-tip"
+                data-tip={`${h.hour}:00 — ${h.activity} aktivitas`}
+              >
                 <div
                   className="hour-bar-fill"
                   style={{ height: `${Math.max(3, (h.activity / maxHour) * 100)}%` }}

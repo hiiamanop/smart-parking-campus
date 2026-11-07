@@ -1,6 +1,9 @@
 import { useEffect, useState, useCallback } from 'react';
 import type { Domain, Zone, LiveEvent } from './types';
-import { fetchZones, subscribeToLiveEvents } from './lib/api';
+import { fetchZones, subscribeToLiveEvents, AuthError, getAdminToken, fetchAuthStatus } from './lib/api';
+import { LoginPage } from './components/LoginPage';
+import { OverviewPanel } from './components/admin/OverviewPanel';
+import { ProfilePanel } from './components/admin/ProfilePanel';
 import { ZoneManager } from './components/admin/ZoneManager';
 import { DomainManager } from './components/admin/DomainManager';
 import { ZoneQRGenerator } from './components/admin/ZoneQRGenerator';
@@ -9,9 +12,16 @@ import { AnalyticsPanel } from './components/admin/AnalyticsPanel';
 import { LiveEventLog } from './components/admin/LiveEventLog';
 import { VlmTestView } from './components/VlmTestView';
 
-type AdminTab = 'domains' | 'zones' | 'qr-signs' | 'analytics' | 'sessions' | 'logs' | 'vlm';
+type AdminTab = 'overview' | 'domains' | 'zones' | 'qr-signs' | 'analytics' | 'sessions' | 'logs' | 'vlm' | 'profile';
 
 const TABS: Array<{ id: AdminTab; label: string; group: string; title: string; sub: string }> = [
+  {
+    id: 'overview',
+    label: 'Ringkasan',
+    group: 'Ringkasan',
+    title: 'Ringkasan operasional',
+    sub: 'Kondisi parkir hari ini: hunian, pendapatan, dan kesehatan kamera gate.',
+  },
   {
     id: 'domains',
     label: 'Domain',
@@ -61,7 +71,95 @@ const TABS: Array<{ id: AdminTab; label: string; group: string; title: string; s
     title: 'Uji VLM plat nomor',
     sub: 'Uji pembacaan plat langsung ke model vision OpenRouter.',
   },
+  {
+    id: 'profile',
+    label: 'Profil',
+    group: 'Akun',
+    title: 'Profil pengelola',
+    sub: 'Identitas tampilan, status token, dan sesi dashboard.',
+  },
 ];
+
+
+// Minimal stroke icons for the sidebar (no emoji)
+const SIDEBAR_ICONS = {
+  overview: (
+    <>
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+    </>
+  ),
+  domains: (
+    <>
+      <path d="M12 3 3 8l9 5 9-5-9-5Z" />
+      <path d="M3 13l9 5 9-5" />
+    </>
+  ),
+  zones: (
+    <>
+      <path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11Z" />
+      <circle cx="12" cy="10" r="2.4" />
+    </>
+  ),
+  'qr-signs': (
+    <>
+      <rect x="4" y="4" width="6" height="6" rx="1" />
+      <rect x="14" y="4" width="6" height="6" rx="1" />
+      <rect x="4" y="14" width="6" height="6" rx="1" />
+      <path d="M14 14h2v2h-2zM18 18h2v2h-2zM14 20h1M20 14h1" />
+    </>
+  ),
+  analytics: (
+    <>
+      <path d="M4 20V10" />
+      <path d="M10 20V4" />
+      <path d="M16 20v-7" />
+      <path d="M22 20H2" />
+    </>
+  ),
+  sessions: (
+    <>
+      <path d="M4 6h16M4 12h16M4 18h10" />
+    </>
+  ),
+  logs: (
+    <>
+      <path d="M3 12h4l3-8 4 16 3-8h4" />
+    </>
+  ),
+  vlm: (
+    <>
+      <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z" />
+      <circle cx="12" cy="12" r="2.6" />
+    </>
+  ),
+  profile: (
+    <>
+      <circle cx="12" cy="8" r="4" />
+      <path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6" />
+    </>
+  ),
+};
+
+function SidebarIcon({ name }: { name: string }) {
+  const icon = SIDEBAR_ICONS[name as keyof typeof SIDEBAR_ICONS] ?? SIDEBAR_ICONS.overview;
+  return (
+    <svg
+      className="side-nav-icon"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {icon}
+    </svg>
+  );
+}
 
 const TAB_STORAGE_KEY = 'smart_parking_admin_tab';
 
@@ -70,7 +168,7 @@ function readInitialTab(): AdminTab {
     const saved = localStorage.getItem(TAB_STORAGE_KEY) as AdminTab | null;
     if (saved && TABS.some((t) => t.id === saved)) return saved;
   } catch {}
-  return 'zones';
+  return 'overview';
 }
 
 export function App() {
@@ -87,6 +185,24 @@ export function App() {
   const [redisConnected, setRedisConnected] = useState<boolean>(false);
   const [eventLogs, setEventLogs] = useState<LiveEvent[]>([]);
   const [latestEventTimestamp, setLatestEventTimestamp] = useState<string>('');
+  const [authState, setAuthState] = useState<'checking' | 'required' | 'ok'>('checking');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('smart_parking_sidebar_collapsed') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleSidebar = () => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('smart_parking_sidebar_collapsed', next ? '1' : '0');
+      } catch {}
+      return next;
+    });
+  };
 
   const loadData = useCallback(() => {
     fetchZones()
@@ -94,7 +210,19 @@ export function App() {
         setDomains(data.domains);
         setZones(data.zones);
       })
-      .catch((err) => console.error('Failed to load zones', err));
+      .catch((err) => {
+        if (err instanceof AuthError) setAuthState('required');
+        else console.error('Failed to load zones', err);
+      });
+  }, []);
+
+  useEffect(() => {
+    fetchAuthStatus()
+      .then((status) => {
+        if (status.adminTokenRequired && !getAdminToken()) setAuthState('required');
+        else setAuthState('ok');
+      })
+      .catch(() => setAuthState('ok'));
   }, []);
 
   useEffect(() => {
@@ -125,19 +253,45 @@ export function App() {
   const current = TABS.find((t) => t.id === activeTab) || TABS[0];
   const occupied = zones.reduce((acc, z) => acc + z.occupied, 0);
 
+  if (authState === 'checking') {
+    return <div className="login-shell"><p className="hint-text">Memeriksa sesi…</p></div>;
+  }
+
+  if (authState === 'required') {
+    return (
+      <LoginPage
+        onSuccess={() => {
+          setAuthState('ok');
+          loadData();
+        }}
+      />
+    );
+  }
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar no-print">
         <div className="brand">
           <img className="brand-logo" src="/logo-itb.png" alt="Logo ITB" />
-          <div>
+          <div className="brand-text">
             <div className="brand-name">Smart Parking</div>
-            <div className="brand-sub">Admin kampus</div>
+            <div className="brand-sub">Konsol admin kampus</div>
           </div>
+          <button
+            type="button"
+            className="sidebar-toggle"
+            onClick={toggleSidebar}
+            aria-label={sidebarCollapsed ? 'Lebarkan sidebar' : 'Ciutkan sidebar'}
+            title={sidebarCollapsed ? 'Lebarkan sidebar' : 'Ciutkan sidebar'}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              {sidebarCollapsed ? <path d="M9 6l6 6-6 6" /> : <path d="M15 6l-6 6 6 6" />}
+            </svg>
+          </button>
         </div>
 
         <nav className="side-nav">
-          {['Kelola', 'Pantau', 'Sistem'].map((group) => (
+          {['Ringkasan', 'Kelola', 'Pantau', 'Akun', 'Sistem'].map((group) => (
             <div key={group} className="side-nav-group">
               <div className="side-nav-label">{group}</div>
               {TABS.filter((t) => t.group === group).map((tab) => (
@@ -146,8 +300,10 @@ export function App() {
                   type="button"
                   className={`side-nav-item ${activeTab === tab.id ? 'active' : ''}`}
                   onClick={() => setActiveTab(tab.id)}
+                  title={tab.label}
                 >
-                  <span>{tab.label}</span>
+                  <SidebarIcon name={tab.id} />
+                  <span className="side-nav-text">{tab.label}</span>
                   {tab.id === 'sessions' && occupied > 0 && (
                     <span className="side-nav-count">{occupied}</span>
                   )}
@@ -161,35 +317,58 @@ export function App() {
         </nav>
 
         <div className="sidebar-footer">
-          <div className={`live-state ${redisConnected ? 'on' : ''}`}>
+          <div className={`sidebar-status ${redisConnected ? 'on' : ''}`}>
             <span className="live-dot" />
-            <span>{redisConnected ? 'Redis terhubung' : 'Redis terputus'}</span>
+            <div>
+              <span className="sidebar-status-title">{redisConnected ? 'Terhubung' : 'Terputus'}</span>
+              <span className="sidebar-status-sub">Redis realtime</span>
+            </div>
           </div>
+
           <a
-            className="link-muted"
+            className="sidebar-link"
             href="https://parkir.hiiamanop.my.id"
             target="_blank"
             rel="noreferrer"
           >
-            Buka aplikasi driver ↗
+            <span>Aplikasi driver</span>
+            <span aria-hidden="true">↗</span>
           </a>
+
+          {getAdminToken() && (
+            <button
+              type="button"
+              className="sidebar-link danger"
+              onClick={() => {
+                try {
+                  localStorage.removeItem('smart_parking_admin_token');
+                } catch {}
+                setAuthState('required');
+              }}
+            >
+              <span>Keluar</span>
+            </button>
+          )}
         </div>
       </aside>
 
       <div className="workspace">
         <header className="workspace-header">
           <div>
+            <div className="workspace-eyebrow">{current.group}</div>
             <h1 className="workspace-title">{current.title}</h1>
             {current.sub && <p className="workspace-sub">{current.sub}</p>}
           </div>
           <div className="header-actions">
-            <div className="metric-inline">
-              <span className="metric-inline-value">{zones.length}</span>
-              <span className="metric-inline-label">zona</span>
-            </div>
-            <div className="metric-inline">
-              <span className="metric-inline-value">{occupied}</span>
-              <span className="metric-inline-label">terisi</span>
+            <div className="header-metrics">
+              <div className="metric-inline">
+                <span className="metric-inline-value">{zones.length}</span>
+                <span className="metric-inline-label">zona</span>
+              </div>
+              <div className="metric-inline">
+                <span className="metric-inline-value">{occupied}</span>
+                <span className="metric-inline-label">terisi</span>
+              </div>
             </div>
             <span className={`status-chip ${redisConnected ? 'ok' : 'off'}`}>
               {redisConnected ? 'Live' : 'Offline'}
@@ -220,6 +399,21 @@ export function App() {
         </nav>
 
         <div className="workspace-body">
+          {activeTab === 'overview' && (
+            <OverviewPanel
+              onNavigate={(tab) => setActiveTab(tab as AdminTab)}
+            />
+          )}
+          {activeTab === 'profile' && (
+            <ProfilePanel
+              onLogout={() => {
+                try {
+                  localStorage.removeItem('smart_parking_admin_token');
+                } catch {}
+                setAuthState('required');
+              }}
+            />
+          )}
           {activeTab === 'domains' && (
             <DomainManager domains={domains} zones={zones} onRefresh={loadData} />
           )}

@@ -4,6 +4,23 @@ import { loadPlateDetector, getDetectorSession, detectPlate, cropPlate, type Pla
 
 type PipelineStep = '1_SCANNING_QR' | '2_READING_PLATE_VLM' | '3_SAVING_OPENING' | '4_GATE_OPENED';
 
+const GATE_TOKEN_KEY = 'smart_parking_gate_token';
+
+function getGateToken(): string {
+  try {
+    return localStorage.getItem(GATE_TOKEN_KEY) || (import.meta.env.VITE_GATE_TOKEN as string) || '';
+  } catch {
+    return '';
+  }
+}
+
+function gateFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const token = getGateToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  return fetch(input, { ...init, headers });
+}
+
 const API_BASE = typeof window !== 'undefined' && window.location.port === '5175' ? 'http://127.0.0.1:8788' : '';
 
 export function App() {
@@ -45,9 +62,13 @@ export function App() {
 
   // Snapshot image when plate is captured
   const [snapshotDataUrl, setSnapshotDataUrl] = useState<string | null>(null);
+  const [qualityScore, setQualityScore] = useState<number | null>(null);
+  const [gateAuthRequired, setGateAuthRequired] = useState(false);
+  const [gateTokenInput, setGateTokenInput] = useState('');
 
   // Ref to prevent multiple concurrent triggers
   const isProcessingRef = useRef(false);
+  const lastMetricsRef = useRef({ sharpness: 0, brightness: 128, contrast: 0 });
 
   // Standby plate-reading loop state
   const [plateStandby, setPlateStandby] = useState(false);
@@ -57,36 +78,48 @@ export function App() {
 
   const STANDBY_FRAME_MS = 900;   // jeda antar frame
   const FRAMES_PER_SEND = 3;      // kirim frame terbaik tiap ~3 frame
-  const MAX_VLM_ATTEMPTS = 4;     // batas panggilan VLM per scan
+  const MAX_VLM_ATTEMPTS = 3;     // batas panggilan konsensus per scan (biaya VLM)
   const MIN_SHARPNESS = 6;        // frame terlalu blur tidak dikirim
 
   // Ambil frame dari video + ukur ketajaman (Laplacian variance)
-  const grabFrame = (): { dataUrl: string; sharpness: number } => {
+  const grabFrame = (): { dataUrl: string; sharpness: number; brightness: number; contrast: number } => {
     const v = videoRef.current;
     const c = canvasRef.current;
-    if (!v || !c || !v.videoWidth || v.readyState < 2) return { dataUrl: '', sharpness: 0 };
+    if (!v || !c || !v.videoWidth || v.readyState < 2) {
+      return { dataUrl: '', sharpness: 0, brightness: 0, contrast: 0 };
+    }
 
     const w = Math.min(v.videoWidth, 960);
     const h = Math.round((v.videoHeight || 720) * (w / (v.videoWidth || w)));
     c.width = w;
     c.height = h;
     const ctx = c.getContext('2d');
-    if (!ctx) return { dataUrl: '', sharpness: 0 };
+    if (!ctx) return { dataUrl: '', sharpness: 0, brightness: 0, contrast: 0 };
     ctx.drawImage(v, 0, 0, w, h);
 
     const data = ctx.getImageData(0, 0, w, h).data;
     const step = Math.max(1, Math.round(w / 240));
     const gw = Math.floor(w / step);
     const gh = Math.floor(h / step);
-    if (gw < 3 || gh < 3) return { dataUrl: c.toDataURL('image/jpeg', 0.85), sharpness: 0 };
+    if (gw < 3 || gh < 3) {
+      return { dataUrl: c.toDataURL('image/jpeg', 0.85), sharpness: 0, brightness: 128, contrast: 0 };
+    }
 
     const gray = new Float32Array(gw * gh);
+    let graySum = 0;
+    let graySumSq = 0;
     for (let y = 0; y < gh; y++) {
       for (let x = 0; x < gw; x++) {
         const i = (y * step * w + x * step) * 4;
-        gray[y * gw + x] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        const g = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        gray[y * gw + x] = g;
+        graySum += g;
+        graySumSq += g * g;
       }
     }
+    const grayCount = gw * gh;
+    const grayMean = graySum / grayCount;
+    const grayContrast = Math.sqrt(Math.max(0, graySumSq / grayCount - grayMean * grayMean));
     let sum = 0;
     let sumSq = 0;
     let n = 0;
@@ -102,7 +135,12 @@ export function App() {
       }
     }
     const mean = n ? sum / n : 0;
-    return { dataUrl: c.toDataURL('image/jpeg', 0.85), sharpness: n ? sumSq / n - mean * mean : 0 };
+    return {
+      dataUrl: c.toDataURL('image/jpeg', 0.85),
+      sharpness: n ? sumSq / n - mean * mean : 0,
+      brightness: grayMean,
+      contrast: grayContrast,
+    };
   };
 
   const stopPlateStandby = useCallback(() => {
@@ -112,19 +150,65 @@ export function App() {
     setPlateStandby(false);
   }, []);
 
-  // Kirim satu frame ke VLM, kembalikan plat (atau null)
-  const requestVlmPlate = async (dataUrl: string): Promise<{ plate: string | null; error?: string }> => {
-    const m = dataUrl.match(/^data:(.*?);base64,(.*)$/);
-    const mimeType = m?.[1] || 'image/jpeg';
-    const imageBase64 = m?.[2] || dataUrl;
-    const res = await fetch(`${API_BASE}/api/vlm/plate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageBase64, mimeType, context: gateMode }),
+  // Ambil beberapa frame berurutan dari kamera untuk konsensus OCR
+  const captureBurst = async (firstDataUrl: string, count = 3, gapMs = 320): Promise<string[]> => {
+    const frames = [firstDataUrl];
+    for (let i = 1; i < count; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, gapMs));
+      const { dataUrl } = grabFrame();
+      if (dataUrl) frames.push(dataUrl);
+    }
+    return frames;
+  };
+
+  // Kirim beberapa frame sekaligus, server memutuskan lewat konsensus
+  const requestConsensus = async (frames: string[]): Promise<{
+    plate: string | null;
+    accepted: boolean;
+    confidence: number;
+    votes: number;
+    total: number;
+    candidates: Array<{ plate: string; votes: number; confidence: number }>;
+    reason?: string;
+    error?: string;
+  }> => {
+    const payload = frames.map((dataUrl) => {
+      const m = dataUrl.match(/^data:(.*?);base64,(.*)$/);
+      return { mimeType: m?.[1] || 'image/jpeg', imageBase64: m?.[2] || dataUrl };
     });
-    const data = await res.json();
-    if (!res.ok || !data.ok) return { plate: null, error: data?.error || 'VLM gagal membaca gambar' };
-    return { plate: data.result?.plate || null };
+    try {
+      const res = await gateFetch(`${API_BASE}/api/vlm/plate/consensus`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ frames: payload, context: gateMode }),
+      });
+      if (res.status === 401 || res.status === 403) setGateAuthRequired(true);
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        return { plate: null, accepted: false, confidence: 0, votes: 0, total: frames.length, candidates: [], error: data?.error };
+      }
+      return data;
+    } catch (err: any) {
+      return { plate: null, accepted: false, confidence: 0, votes: 0, total: frames.length, candidates: [], error: err?.message };
+    }
+  };
+
+  // Report local image-quality metrics so the dashboard can spot degrading cameras
+  const reportImageQuality = async (metrics?: { sharpness: number; brightness: number; contrast: number }) => {
+    const m = metrics || lastMetricsRef.current;
+    if (!m) return;
+    try {
+      const res = await gateFetch(`${API_BASE}/api/gates/gate-${gateMode}/quality`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(m),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) setQualityScore(data.score);
+    } catch {
+      // quality telemetry is best-effort
+    }
   };
 
   // Standby: kamera tetap live, deteksi plat on-device (ONNX) lalu kirim crop ke VLM;
@@ -176,28 +260,41 @@ export function App() {
       }
 
       setPlateAttempt(attempt);
-      setStatusText(`AI membaca plat... percobaan ${attempt}/${MAX_VLM_ATTEMPTS}`);
+      const burstSize = attempt === 1 ? 3 : 2;
+      setStatusText(`AI membaca ${burstSize} frame plat... percobaan ${attempt}/${MAX_VLM_ATTEMPTS}`);
       try {
-        const { plate, error } = await requestVlmPlate(dataUrl);
+        const frames = await captureBurst(dataUrl, burstSize);
+        const decision = await requestConsensus(frames);
         if (standbyRef.current.cancelled) return true;
-        if (plate) {
+
+        await reportImageQuality();
+
+        if (decision.accepted && decision.plate) {
           stopPlateStandby();
           setSnapshotDataUrl(dataUrl);
-          setVlmPlate(plate);
-          await savePlateAndOpenGate(code, plate);
+          setVlmPlate(decision.plate);
+          await savePlateAndOpenGate(code, decision.plate);
+          setStatusText(
+            `KONSENSUS ${decision.votes}/${decision.total} FRAME: ${decision.plate} (conf ${Math.round(decision.confidence * 100)}%). PALANG TERBUKA.`
+          );
           return true;
         }
+
+        const candidates = (decision.candidates || []).map((c) => c.plate).filter(Boolean);
+        const candidateText = candidates.length ? ` Kandidat: ${candidates.slice(0, 3).join(', ')}.` : '';
+
         if (attempt >= MAX_VLM_ATTEMPTS) {
           setSnapshotDataUrl(dataUrl);
           stopPlateStandby();
           setStatusText('Standby plat dihentikan. Menunggu tindakan operator.');
           setErrorText(
-            `Plat belum terbaca setelah ${attempt} percobaan (${error || 'plat tidak terdeteksi'}). ` +
+            `Konsensus plat tidak tercapai setelah ${attempt} percobaan.${candidateText} ` +
             'Pastikan plat terlihat jelas dan tidak blur, lalu tekan "Baca Plat Lagi" atau gunakan Upload Foto.'
           );
           return true;
         }
-        setStatusText(`Plat belum terbaca (percobaan ${attempt}/${MAX_VLM_ATTEMPTS}). Tetap standby...`);
+
+        setStatusText(`Konsensus lemah (${decision.votes || 0}/${decision.total} frame).${candidateText} Tetap standby...`);
         return false;
       } catch (err: any) {
         if (standbyRef.current.cancelled) return true;
@@ -216,6 +313,7 @@ export function App() {
 
       frames++;
       const frame = grabFrame();
+      if (frame.dataUrl) lastMetricsRef.current = frame;
       if (frame.dataUrl && frame.sharpness > best.sharpness) best = frame;
 
       // 1) On-device detector: bila plat terdeteksi stabil -> crop & kirim ke VLM
@@ -401,7 +499,7 @@ export function App() {
 
     try {
       if (gateMode === 'entry') {
-        const res = await fetch(`${API_BASE}/api/gates/entry`, {
+        const res = await gateFetch(`${API_BASE}/api/gates/entry`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -409,6 +507,7 @@ export function App() {
             manualPlateOverride: plateText,
           }),
         });
+        if (res.status === 401 || res.status === 403) setGateAuthRequired(true);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal menyimpan plat ke gate masuk');
 
@@ -418,7 +517,7 @@ export function App() {
         setStatusText(`PLAT ${data.session.plate} TERSIMPAN! PALANG GATE MASUK TERBUKA.`);
       } else {
         // Exit Gate
-        const res = await fetch(`${API_BASE}/api/gates/exit`, {
+        const res = await gateFetch(`${API_BASE}/api/gates/exit`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -426,6 +525,7 @@ export function App() {
             manualPlateOverride: plateText,
           }),
         });
+        if (res.status === 401 || res.status === 403) setGateAuthRequired(true);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Gate keluar ditolak');
 
@@ -456,26 +556,25 @@ export function App() {
     setErrorText(null);
 
     try {
-      const m = snapshotBase64.match(/^data:(.*?);base64,(.*)$/);
-      const mimeType = m?.[1] || 'image/jpeg';
-      const imageBase64 = m?.[2] || snapshotBase64;
+      const decision = await requestConsensus([snapshotBase64]);
+      await reportImageQuality();
+      if (decision.error) throw new Error(decision.error);
 
-      const res = await fetch(`${API_BASE}/api/vlm/plate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64, mimeType, context: gateMode }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.ok) throw new Error(data.error || 'AI VLM gagal membaca gambar');
-
-      const plate = data.result?.plate;
-      if (!plate) {
+      if (!decision.plate) {
         throw new Error('Plat nomor tidak terbaca oleh AI VLM. Pastikan plat berada di depan kamera.');
       }
+      if (!decision.accepted) {
+        const candidates = (decision.candidates || []).map((c) => c.plate).filter(Boolean);
+        throw new Error(
+          `Konsensus belum kuat (conf ${Math.round((decision.confidence || 0) * 100)}%).` +
+          (candidates.length ? ` Kandidat: ${candidates.slice(0, 3).join(', ')}.` : '') +
+          ' Gunakan standby kamera atau upload foto yang lebih jelas.'
+        );
+      }
 
-      setVlmPlate(plate);
+      setVlmPlate(decision.plate);
       // Immediately proceed to save and open barrier!
-      await savePlateAndOpenGate(code, plate);
+      await savePlateAndOpenGate(code, decision.plate);
     } catch (err: any) {
       setErrorText(err.message || String(err));
       // If VLM fails, reset after 3 seconds so driver can realign plate
@@ -596,6 +695,37 @@ export function App() {
     };
     r.readAsDataURL(file);
   };
+
+  if (gateAuthRequired) {
+    return (
+      <div className="kiosk-auth">
+        <form
+          className="kiosk-auth-card"
+          onSubmit={(e) => {
+            e.preventDefault();
+            try {
+              localStorage.setItem(GATE_TOKEN_KEY, gateTokenInput.trim());
+            } catch {}
+            setGateAuthRequired(false);
+            setGateTokenInput('');
+            resetPipeline();
+          }}
+        >
+          <img src="/logo-itb.png" alt="Logo ITB" className="kiosk-logo" />
+          <h1>Token perangkat gate</h1>
+          <p className="hint-text">Masukkan token gate yang dikonfigurasi di server untuk mengaktifkan terminal ini.</p>
+          <input
+            type="password"
+            value={gateTokenInput}
+            onChange={(e) => setGateTokenInput(e.target.value)}
+            placeholder="GATE_API_TOKEN"
+            required
+          />
+          <button type="submit" className="btn-kiosk-action">Aktifkan terminal</button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div className="kiosk-app-frame">
@@ -762,7 +892,12 @@ export function App() {
 
       {/* Bottom Controls / Fallback options */}
       <div className="bottom-controls-card">
-        <div style={{ display: 'flex', gap: 10 }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          {qualityScore !== null && (
+            <span className={`quality-chip ${qualityScore < 50 ? 'low' : ''}`}>
+              Kualitas gambar {qualityScore}/100
+            </span>
+          )}
           <button
             type="button"
             className="btn-kiosk-action sec"

@@ -146,3 +146,30 @@ DNS (zone `hiiamanop.my.id`), semua **CNAME** ke `efa3575e-ce9a-400c-ab75-c9edb5
 - [User Story](docs/user-story.md)
 - [Product Backlog](docs/backlog.md)
 - [BRD](docs/brd.md)
+
+## Keamanan & operasi (P0/P1)
+
+Variabel `.env` tambahan:
+
+```bash
+# Wajib untuk produksi. Jika kosong, API admin/gate terbuka (hanya untuk dev).
+ADMIN_API_TOKEN=ganti-token-admin-panjang
+GATE_API_TOKEN=ganti-token-gate-panjang
+
+# Opsional: arsip historis ke Supabase/Postgres
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=service-role-key
+SUPABASE_TABLE=parking_history
+
+# Opsional
+VLM_TIMEOUT_MS=20000
+HISTORY_DIR=./data/history
+```
+
+- **Admin**: dashboard meminta token saat pertama dibuka (`ADMIN_API_TOKEN`).
+- **Gate**: terminal kios meminta token perangkat (`GATE_API_TOKEN`) atau `VITE_GATE_TOKEN` saat build.
+- **Rate limit** bawaan: VLM 30/menit, tulis 30/menit, baca 180/menit per IP/token.
+- **Health**: `GET /health` memeriksa Redis. **Metrik**: `GET /metrics` (format Prometheus).
+- **Histori**: setiap perubahan status sesi ditulis ke `data/history/YYYY-MM-DD.jsonl`; bila Supabase dikonfigurasi, juga dikirim ke tabel `parking_history` (lihat `supabase/history.sql`).
+- **Kedaluwarsa**: scheduler internal berjalan tiap 30 detik untuk melepas booking yang hangus.
+- **Tes terisolasi**: `npm --prefix server test` memakai Redis DB 15, server sementara di port 8799, dan token tes. CI: `.github/workflows/ci.yml`.

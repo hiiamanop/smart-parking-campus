@@ -1,5 +1,6 @@
 import Redis from 'ioredis';
 import crypto from 'node:crypto';
+import { persistSession } from './persistence.mjs';
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 export const EVENT_CHANNEL = 'parking:events';
@@ -23,6 +24,47 @@ const INITIAL_ZONES = [
 ];
 
 const VEHICLE_TYPES = ['car', 'motorcycle'];
+
+// Per-zone daily reservation counter. Prevents race conditions on quota.
+function counterKey(day, zoneId) {
+  return `parking:count:${day}:${zoneId}`;
+}
+
+const RESERVE_LUA = `
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local capacity = tonumber(ARGV[1])
+if current >= capacity then return 0 end
+redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], 172800)
+return 1
+`;
+
+// Cross-instance lock for session state transitions
+async function withSessionLock(sessionCode, fn, ttlMs = 8000) {
+  const key = `parking:lock:${sessionCode}`;
+  const token = crypto.randomUUID();
+  const ok = await redis.set(key, token, 'PX', ttlMs, 'NX');
+  if (!ok) throw new Error('Sesi sedang diproses. Coba lagi.');
+  try {
+    return await fn();
+  } finally {
+    const release = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end`;
+    try { await redis.eval(release, 1, key, token); } catch {}
+  }
+}
+
+async function releaseBookingSlot(session) {
+  const day = session.bookingDate || (session.etaTime ? new Date(session.etaTime).toISOString().slice(0, 10) : null);
+  if (!day || !session.zoneId) return;
+  const key = counterKey(day, session.zoneId);
+  const value = await redis.decr(key);
+  if (value < 0) await redis.set(key, 0);
+}
+
+// QR validity windows (milliseconds)
+export const ENTRY_QR_TTL_MS = 15 * 60 * 1000; // from ETA
+const EXIT_QR_TTL_S = 20 * 60;               // from payment
+export const EXIT_EXPIRED_PENALTY = 20000;   // denda QR keluar kedaluwarsa
 
 // Helper to normalize plate string for matching
 export function normalizePlate(str) {
@@ -81,42 +123,58 @@ export async function publishEvent(type, payload) {
     timestamp: new Date().toISOString(),
   };
   await redis.publish(EVENT_CHANNEL, JSON.stringify(event));
+  // Keep a capped history for the audit log date filter
+  try {
+    const multi = redis.multi();
+    multi.lpush('parking:events:log', JSON.stringify(event));
+    multi.ltrim('parking:events:log', 0, 4999);
+    await multi.exec();
+  } catch {
+    // history is best-effort
+  }
+}
+
+// Audit log history for a given date (YYYY-MM-DD), newest first
+export async function getEventHistory({ date, from, to, limit = 200 } = {}) {
+  const start = from || date || null;
+  const end = to || date || start;
+  const raw = await redis.lrange('parking:events:log', 0, 4999);
+  const events = [];
+  for (const item of raw) {
+    try {
+      const event = JSON.parse(item);
+      const day = String(event.timestamp || '').slice(0, 10);
+      const inRange = (!start || day >= start) && (!end || day <= end);
+      if (inRange) {
+        events.push(event);
+        if (events.length >= limit) break;
+      }
+    } catch {
+      // skip malformed entries
+    }
+  }
+  return events;
 }
 
 // Get all domains and zones with live occupancy counts
 export async function getZonesWithOccupancy() {
   await initMasterData();
-  const [domainsRaw, zonesRaw, activeSessionCodes] = await Promise.all([
+  const [domainsRaw, zonesRaw] = await Promise.all([
     redis.get('parking:master:domains'),
     redis.get('parking:master:zones'),
-    redis.smembers('parking:active_sessions'),
   ]);
 
   const domains = JSON.parse(domainsRaw || '[]');
   const zones = JSON.parse(zonesRaw || '[]');
 
-  // Check expiration of active bookings and tally occupancy
+  // Occupancy for today comes from the per-date reservation counters
+  const today = new Date().toISOString().slice(0, 10);
   const counts = {};
-  for (const zone of zones) counts[zone.id] = 0;
-
-  for (const code of activeSessionCodes) {
-    const sess = await getSession(code);
-    if (!sess) continue;
-
-    // Check if expired due to 10 min late rule
-    if (checkSessionExpired(sess)) {
-      sess.status = 'EXPIRED';
-      sess.expiredReason = 'Late arrival > 10 minutes from ETA';
-      await saveSession(sess);
-      await redis.srem('parking:active_sessions', code);
-      await publishEvent('SESSION_EXPIRED', { sessionCode: code, zoneId: sess.zoneId });
-      continue;
-    }
-
-    if (['BOOKED', 'ENTERED', 'PARKED_CONFIRMED', 'CHECKOUT_REQUESTED', 'PAID'].includes(sess.status)) {
-      counts[sess.zoneId] = (counts[sess.zoneId] || 0) + 1;
-    }
-  }
+  await Promise.all(
+    zones.map(async (zone) => {
+      counts[zone.id] = Number((await redis.get(counterKey(today, zone.id))) || 0);
+    })
+  );
 
   const zonesWithLive = zones.map((z) => {
     const occupied = counts[z.id] || 0;
@@ -135,10 +193,9 @@ export async function getZonesWithOccupancy() {
 // Check if a session has expired (ETA + 10 mins)
 export function checkSessionExpired(sess) {
   if (sess.status !== 'BOOKED') return false;
-  if (!sess.etaTime) return false;
-  const now = Date.now();
-  const graceMs = 10 * 60 * 1000; // 10 minutes grace period
-  return now > sess.etaTime + graceMs;
+  const expiry = sess.entryQrExpiresAt || (sess.etaTime ? sess.etaTime + ENTRY_QR_TTL_MS : 0);
+  if (!expiry) return false;
+  return Date.now() > expiry;
 }
 
 // Activity counters per zone, used for preventive-maintenance analytics.
@@ -149,12 +206,16 @@ export async function recordActivity(zoneId, event, { amount = 1, countActivity 
   const key = `parking:stats:zone:${zoneId}`;
   const now = new Date();
   const hour = String(now.getHours()).padStart(2, '0');
+  const day = now.toISOString().slice(0, 10);
   const multi = redis.multi();
   multi.hincrby(key, event, amount);
   multi.hset(key, 'lastActivity', now.toISOString());
+  multi.hincrby(`parking:stats:zone:day:${day}`, `${zoneId}:${event}`, amount);
   if (countActivity) {
     multi.hincrby(key, 'activity', amount);
+    multi.hincrby(`parking:stats:zone:day:${day}`, `${zoneId}:activity`, amount);
     multi.hincrby('parking:stats:hours', hour, amount);
+    multi.hincrby(`parking:stats:hours:${day}`, hour, amount);
   }
   try {
     await multi.exec();
@@ -173,6 +234,9 @@ export async function recordRevenue(zoneId, amount, vehicleType) {
   multi.hincrby(key, 'payments', 1);
   multi.hincrby(key, vehicleType === 'car' ? 'revenueCar' : 'revenueMotorcycle', amount);
   multi.hincrbyfloat('parking:stats:revenue:days', day, amount);
+  multi.hincrby(`parking:stats:zone:revenue:day:${day}`, zoneId, amount);
+  multi.hincrby(`parking:stats:zone:revenue:day:${day}`, `${zoneId}:${vehicleType === 'car' ? 'car' : 'motorcycle'}`, amount);
+  multi.hincrby(`parking:stats:zone:payments:day:${day}`, zoneId, 1);
   try {
     await multi.exec();
   } catch {
@@ -180,12 +244,167 @@ export async function recordRevenue(zoneId, amount, vehicleType) {
   }
 }
 
+// Gate camera image-quality sampling (local CV metrics sent by the kiosk)
+export function scoreImageQuality({ sharpness = 0, brightness = 128, contrast = 0 }) {
+  const clamp = (v) => Math.max(0, Math.min(1, v));
+  const sharpScore = clamp(sharpness / 40);
+  const brightScore = clamp(1 - Math.abs(brightness - 128) / 128);
+  const contrastScore = clamp(contrast / 50);
+  return Math.round(100 * (0.5 * sharpScore + 0.3 * brightScore + 0.2 * contrastScore));
+}
+
+export async function recordGateQuality(gateId, metrics = {}) {
+  if (!gateId) throw new Error('gateId wajib diisi');
+  const score = scoreImageQuality(metrics);
+  const key = `parking:stats:gate:${gateId}`;
+  const recentKey = `parking:quality:recent:${gateId}`;
+  const now = new Date().toISOString();
+
+  const previous = Number((await redis.hget(key, 'ewma')) || score);
+  const ewma = Math.round(previous * 0.8 + score * 0.2);
+
+  const multi = redis.multi();
+  multi.hincrby(key, 'samples', 1);
+  multi.hincrby(key, 'scoreSum', score);
+  multi.hincrby(key, 'lowSamples', score < 50 ? 1 : 0);
+  multi.hset(key, {
+    ewma,
+    lastScore: score,
+    lastAt: now,
+    lastSharpness: Math.round(metrics.sharpness || 0),
+    lastBrightness: Math.round(metrics.brightness || 0),
+    lastContrast: Math.round(metrics.contrast || 0),
+  });
+  multi.lpush(recentKey, score);
+  multi.ltrim(recentKey, 0, 19);
+  await multi.exec();
+
+  await publishEvent('GATE_QUALITY', { gateId, score, ewma });
+  return { gateId, score, ewma, at: now };
+}
+
+export async function getGateQuality() {
+  const keys = await redis.keys('parking:stats:gate:*');
+  const gates = [];
+  for (const key of keys) {
+    const gateId = key.replace('parking:stats:gate:', '');
+    const raw = await redis.hgetall(key);
+    const recent = (await redis.lrange(`parking:quality:recent:${gateId}`, 0, 9)).map(Number);
+    const samples = Number(raw.samples || 0);
+    const sorted = [...recent];
+    const latest = sorted.slice(0, 3);
+    const previous = sorted.slice(3, 6);
+    const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
+    const trend = previous.length ? Math.round(avg(latest) - avg(previous)) : 0;
+    const ewma = Number(raw.ewma || 0);
+
+    let status = 'baik';
+    if (ewma < 50 || (latest.length >= 3 && avg(latest) < 50)) status = 'perlu-perhatian';
+    else if (trend <= -8) status = 'menurun';
+
+    gates.push({
+      gateId,
+      samples,
+      ewma,
+      lastScore: Number(raw.lastScore || 0),
+      lastAt: raw.lastAt || null,
+      lowSamples: Number(raw.lowSamples || 0),
+      average: samples > 0 ? Math.round(Number(raw.scoreSum || 0) / samples) : 0,
+      recent,
+      trend,
+      status,
+      lastSharpness: Number(raw.lastSharpness || 0),
+      lastBrightness: Number(raw.lastBrightness || 0),
+      lastContrast: Number(raw.lastContrast || 0),
+    });
+  }
+  return gates.sort((a, b) => a.ewma - b.ewma);
+}
+
+// Penalty counters (expired exit QR redemption)
+export async function recordPenalty(zoneId, amount) {
+  if (!zoneId || !amount) return;
+  const key = `parking:stats:zone:${zoneId}`;
+  const day = new Date().toISOString().slice(0, 10);
+  const multi = redis.multi();
+  multi.hincrby(key, 'penaltyRevenue', amount);
+  multi.hincrby(key, 'penaltyCount', 1);
+  multi.hincrby(key, 'expiredExitCount', 1);
+  multi.hincrbyfloat('parking:stats:penalty:days', day, amount);
+  multi.hincrby(`parking:stats:zone:penalty:day:${day}`, zoneId, amount);
+  multi.hincrby(`parking:stats:zone:day:${day}`, `${zoneId}:penalty`, amount);
+  multi.hincrby(`parking:stats:zone:day:${day}`, `${zoneId}:penaltyCount`, 1);
+  try {
+    await multi.exec();
+  } catch {
+    // best-effort
+  }
+}
+
 // Analytics: zone/domain activity, occupancy, peak hours, maintenance priority
-export async function getAnalytics() {
+function buildDayRange(from, to, maxDays = 92) {
+  const start = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return [];
+  const days = [];
+  for (let d = new Date(start); d <= end && days.length < maxDays; d.setUTCDate(d.getUTCDate() + 1)) {
+    days.push(d.toISOString().slice(0, 10));
+  }
+  return days;
+}
+
+async function sumHashes(keys) {
+  const total = {};
+  for (const key of keys) {
+    const hash = await redis.hgetall(key);
+    for (const [field, value] of Object.entries(hash)) {
+      total[field] = Number(total[field] || 0) + Number(value || 0);
+    }
+  }
+  return total;
+}
+
+export async function getAnalytics({ date, from, to } = {}) {
   const { domains, zones } = await getZonesWithOccupancy();
+
+  const rangeFrom = from || to || date;
+  const rangeTo = to || from || date;
+  const days = rangeFrom && rangeTo ? buildDayRange(rangeFrom, rangeTo) : [];
+  const rangeMode = days.length > 0;
+
+  let dayActivity = null;
+  let dayRevenue = null;
+  let dayPayments = null;
+  let rangeHours = null;
+  if (rangeMode) {
+    dayActivity = await sumHashes(days.map((d) => `parking:stats:zone:day:${d}`));
+    dayRevenue = await sumHashes(days.map((d) => `parking:stats:zone:revenue:day:${d}`));
+    dayPayments = await sumHashes(days.map((d) => `parking:stats:zone:payments:day:${d}`));
+    rangeHours = await sumHashes(days.map((d) => `parking:stats:hours:${d}`));
+  }
 
   const zoneStats = {};
   for (const z of zones) {
+    if (rangeMode) {
+      const ev = (name) => Number(dayActivity[`${z.id}:${name}`] || 0);
+      zoneStats[z.id] = {
+        bookings: ev('bookings'),
+        entries: ev('entries'),
+        exits: ev('exits'),
+        manualOverrides: ev('manualOverrides'),
+        mismatches: ev('mismatches'),
+        zoneViolations: ev('zoneViolations'),
+        revenue: Number(dayRevenue[z.id] || 0),
+        payments: Number(dayPayments[z.id] || 0),
+        revenueMotorcycle: Number(dayRevenue[`${z.id}:motorcycle`] || 0),
+        revenueCar: Number(dayRevenue[`${z.id}:car`] || 0),
+        penaltyRevenue: ev('penalty'),
+        penaltyCount: ev('penaltyCount'),
+        activity: ev('activity') || ev('bookings') + ev('entries') + ev('exits'),
+        lastActivity: null,
+      };
+      continue;
+    }
     const raw = await redis.hgetall(`parking:stats:zone:${z.id}`);
     zoneStats[z.id] = {
       bookings: Number(raw.bookings || 0),
@@ -198,6 +417,8 @@ export async function getAnalytics() {
       payments: Number(raw.payments || 0),
       revenueMotorcycle: Number(raw.revenueMotorcycle || 0),
       revenueCar: Number(raw.revenueCar || 0),
+      penaltyRevenue: Number(raw.penaltyRevenue || 0),
+      penaltyCount: Number(raw.penaltyCount || 0),
       activity: Number(raw.activity || 0),
       lastActivity: raw.lastActivity || null,
     };
@@ -253,7 +474,7 @@ export async function getAnalytics() {
     };
   }).sort((a, b) => b.activity - a.activity);
 
-  const hoursRaw = await redis.hgetall('parking:stats:hours');
+  const hoursRaw = rangeMode ? rangeHours : await redis.hgetall('parking:stats:hours');
   const hours = Array.from({ length: 24 }, (_, h) => {
     const key = String(h).padStart(2, '0');
     return { hour: key, activity: Number(hoursRaw[key] || 0) };
@@ -262,16 +483,25 @@ export async function getAnalytics() {
 
   const daysRaw = await redis.hgetall('parking:stats:revenue:days');
   const dayList = [];
-  for (let i = 6; i >= 0; i -= 1) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    const key = d.toISOString().slice(0, 10);
-    dayList.push({ date: key, revenue: Math.round(Number(daysRaw[key] || 0)) });
+  if (rangeMode) {
+    for (const key of days.slice(-31)) {
+      dayList.push({ date: key, revenue: Math.round(Number(daysRaw[key] || 0)) });
+    }
+  } else {
+    for (let i = 6; i >= 0; i -= 1) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      dayList.push({ date: key, revenue: Math.round(Number(daysRaw[key] || 0)) });
+    }
   }
 
+  const totalPenaltyRevenue = enrichedZones.reduce((a, z) => a + (z.penaltyRevenue || 0), 0);
   const finance = {
     totalRevenue: enrichedZones.reduce((a, z) => a + z.revenue, 0),
     totalPayments: enrichedZones.reduce((a, z) => a + z.payments, 0),
+    penaltyRevenue: totalPenaltyRevenue,
+    grandTotal: enrichedZones.reduce((a, z) => a + z.revenue + (z.penaltyRevenue || 0), 0),
     byVehicle: {
       motorcycle: enrichedZones.reduce((a, z) => a + z.revenueMotorcycle, 0),
       car: enrichedZones.reduce((a, z) => a + z.revenueCar, 0),
@@ -283,6 +513,7 @@ export async function getAnalytics() {
         domainId: z.domainId,
         revenue: z.revenue,
         payments: z.payments,
+        penaltyRevenue: z.penaltyRevenue || 0,
         average: z.payments > 0 ? Math.round(z.revenue / z.payments) : 0,
       }))
       .sort((a, b) => b.revenue - a.revenue),
@@ -303,9 +534,13 @@ export async function getAnalytics() {
     daily: dayList,
   };
 
+  const gateQuality = await getGateQuality();
+
   return {
     generatedAt: new Date().toISOString(),
+    period: rangeMode ? `${days[0]}..${days[days.length - 1]}` : 'all',
     finance,
+    gates: gateQuality,
     totals: {
       activity: enrichedZones.reduce((a, z) => a + z.activity, 0),
       entries: enrichedZones.reduce((a, z) => a + z.entries, 0),
@@ -315,6 +550,8 @@ export async function getAnalytics() {
       zoneViolations: enrichedZones.reduce((a, z) => a + z.zoneViolations, 0),
       revenue: finance.totalRevenue,
       payments: finance.totalPayments,
+      penaltyRevenue: finance.penaltyRevenue,
+      penalties: enrichedZones.reduce((a, z) => a + (z.penaltyCount || 0), 0),
       highPriorityZones: enrichedZones.filter((z) => z.priority === 'tinggi').length,
     },
     zones: enrichedZones,
@@ -329,7 +566,6 @@ export async function createBooking({ domainId, zoneId, userName, vehicleType, e
   const { zones } = await getZonesWithOccupancy();
   const targetZone = zones.find((z) => z.id === zoneId);
   if (!targetZone) throw new Error('Zona tidak ditemukan');
-  if (targetZone.available <= 0) throw new Error('Kuota parkir di zona ini sudah penuh');
 
   const vehicle = vehicleType || 'motorcycle';
   if (targetZone.vehicleType && targetZone.vehicleType !== vehicle) {
@@ -337,8 +573,6 @@ export async function createBooking({ domainId, zoneId, userName, vehicleType, e
       `Zona ${targetZone.name} hanya untuk ${targetZone.vehicleType === 'car' ? 'mobil' : 'motor'}.`
     );
   }
-
-  const sessionCode = `SP-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
   // Calculate ETA timestamp
   const now = new Date();
@@ -360,6 +594,14 @@ export async function createBooking({ domainId, zoneId, userName, vehicleType, e
     etaTime = now.getTime() + 30 * 60 * 1000; // default 30 min from now
   }
 
+  // Quota is reserved per booking date; atomic INCR avoids overbooking races.
+  const bookingDate = new Date(etaTime).toISOString().slice(0, 10);
+  const reserved = await redis.eval(RESERVE_LUA, 1, counterKey(bookingDate, zoneId), targetZone.capacity);
+  if (!reserved) {
+    throw new Error('Kuota parkir di zona ini sudah penuh untuk tanggal tersebut');
+  }
+
+  const sessionCode = `SP-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
   const session = {
     id: crypto.randomUUID(),
     sessionCode,
@@ -369,15 +611,23 @@ export async function createBooking({ domainId, zoneId, userName, vehicleType, e
     vehicleType: vehicle,
     eta: eta || '08:30',
     etaTime,
+    bookingDate,
+    entryQrExpiresAt: etaTime + ENTRY_QR_TTL_MS,
     status: 'BOOKED',
     createdAt: now.toISOString(),
     plate: null, // Will be read and locked by VLM at Gate In
   };
 
-  await saveSession(session);
-  await redis.sadd('parking:active_sessions', sessionCode);
+  try {
+    await saveSession(session);
+    await redis.sadd('parking:active_sessions', sessionCode);
+  } catch (err) {
+    await releaseBookingSlot(session);
+    throw err;
+  }
 
   await recordActivity(zoneId, 'bookings');
+  persistSession(session);
 
   await publishEvent('BOOKING_CREATED', { sessionCode, zoneId, available: targetZone.available - 1 });
   await publishEvent('ZONE_UPDATED', await getZonesWithOccupancy());
@@ -399,15 +649,18 @@ export async function saveSession(session) {
   await redis.set(`parking:session:${session.sessionCode}`, JSON.stringify(session), 'EX', 86400);
   if (session.exitCode) {
     // Also index exitCode for fast lookup
-    await redis.set(`parking:exit:${session.exitCode}`, session.sessionCode, 'EX', 3600);
+    await redis.set(`parking:exit:${session.exitCode}`, session.sessionCode, 'EX', EXIT_QR_TTL_S);
   }
 }
 
 // Gate In entry processing
-export async function processGateIn({ sessionCode, plateRead, manualPlateOverride }) {
+async function processGateInInner({ sessionCode, plateRead, manualPlateOverride }) {
   const session = await getSession(sessionCode);
   if (!session) throw new Error('Sesi parkir tidak ditemukan');
 
+  if (session.status === 'EXPIRED') {
+    throw new Error('QR masuk sudah kedaluwarsa (15 menit sejak ETA). Silakan booking ulang.');
+  }
   if (session.status !== 'BOOKED') {
     throw new Error(`Status sesi tidak valid untuk masuk: ${session.status}`);
   }
@@ -415,11 +668,13 @@ export async function processGateIn({ sessionCode, plateRead, manualPlateOverrid
   // Check 10 minute rule
   if (checkSessionExpired(session)) {
     session.status = 'EXPIRED';
-    session.expiredReason = 'Late arrival > 10 minutes from ETA';
+    session.expiredReason = 'QR masuk kedaluwarsa (15 menit dari ETA)';
     await saveSession(session);
     await redis.srem('parking:active_sessions', sessionCode);
+    await releaseBookingSlot(session);
+    persistSession(session);
     await publishEvent('SESSION_EXPIRED', { sessionCode, zoneId: session.zoneId });
-    throw new Error('Booking hangus karena telat lebih dari 10 menit dari ETA');
+    throw new Error('QR masuk sudah kedaluwarsa (15 menit sejak ETA). Silakan booking ulang.');
   }
 
   const rawPlate = manualPlateOverride || plateRead?.plate;
@@ -437,6 +692,7 @@ export async function processGateIn({ sessionCode, plateRead, manualPlateOverrid
 
   await recordActivity(session.zoneId, 'entries');
   if (manualPlateOverride) await recordActivity(session.zoneId, 'manualOverrides', { countActivity: false });
+  persistSession(session);
 
   await publishEvent('GATE_ENTERED', { sessionCode, plate: session.plate, zoneId: session.zoneId });
   await publishEvent('ZONE_UPDATED', await getZonesWithOccupancy());
@@ -445,21 +701,46 @@ export async function processGateIn({ sessionCode, plateRead, manualPlateOverrid
 }
 
 // Zone QR scan: confirm parking or initiate checkout
-export async function processZoneScan({ sessionCode, scannedZoneId, action }) {
+async function processZoneScanInner({ sessionCode, scannedZoneId, action }) {
   const session = await getSession(sessionCode);
   if (!session) throw new Error('Sesi parkir tidak ditemukan');
 
   // Zone enforcement: a session may only be confirmed/checked out at its own zone.
   if (session.zoneId !== scannedZoneId) {
-    await recordActivity(session.zoneId, 'zoneViolations', { countActivity: false });
-    await publishEvent('ZONE_VIOLATION', {
+    const previousMisses = Number(session.zoneScanMisses || 0);
+    session.zoneScanMisses = previousMisses + 1;
+
+    // Grace: one wrong scan is treated as a mistake (warning only).
+    // Violations count from the second miss onward, in any session status.
+    const countsAsViolation = previousMisses >= 1;
+    if (countsAsViolation) {
+      await recordActivity(session.zoneId, 'zoneViolations', { countActivity: false });
+    }
+    await saveSession(session);
+
+    await publishEvent('ZONE_MISMATCH', {
       sessionCode,
       expectedZoneId: session.zoneId,
       scannedZoneId: scannedZoneId || null,
       action,
+      countedAsViolation: countsAsViolation,
     });
+
+    if (countsAsViolation) {
+      await publishEvent('ZONE_VIOLATION', {
+        sessionCode,
+        expectedZoneId: session.zoneId,
+        scannedZoneId: scannedZoneId || null,
+        action,
+      });
+      throw new Error(
+        `QR zona tidak sesuai (pelanggaran tercatat). Sesi ini hanya berlaku di zona ${session.zoneId}; Anda memindai ${scannedZoneId}. Silakan pindai ulang di zona yang benar.`
+      );
+    }
+
     throw new Error(
-      `QR zona tidak sesuai. Sesi ini hanya berlaku di zona ${session.zoneId}; Anda memindai ${scannedZoneId}.`
+      `QR zona tidak sesuai. Sesi ini hanya berlaku di zona ${session.zoneId}; Anda memindai ${scannedZoneId}. ` +
+        'Ini masih dianggap kekeliruan — pindai ulang di zona yang benar.'
     );
   }
 
@@ -472,6 +753,7 @@ export async function processZoneScan({ sessionCode, scannedZoneId, action }) {
     session.status = 'PARKED_CONFIRMED';
     session.parkedTime = now.toISOString();
     await saveSession(session);
+    persistSession(session);
     await publishEvent('PARKED_CONFIRMED', { sessionCode, zoneId: session.zoneId });
     return session;
   }
@@ -510,6 +792,7 @@ export async function processZoneScan({ sessionCode, scannedZoneId, action }) {
     };
 
     await saveSession(session);
+    persistSession(session);
     await publishEvent('BILL_CREATED', { sessionCode, bill: session.bill });
     return session;
   }
@@ -518,7 +801,7 @@ export async function processZoneScan({ sessionCode, scannedZoneId, action }) {
 }
 
 // Process payment
-export async function processPayment({ sessionCode, paymentMethod = 'QRIS' }) {
+async function processPaymentInner({ sessionCode, paymentMethod = 'QRIS' }) {
   const session = await getSession(sessionCode);
   if (!session) throw new Error('Sesi parkir tidak ditemukan');
 
@@ -527,11 +810,11 @@ export async function processPayment({ sessionCode, paymentMethod = 'QRIS' }) {
   }
 
   const now = new Date();
-  const exitCode = `OUT-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+  const exitCode = `OUT-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
 
   session.status = 'PAID';
   session.exitCode = exitCode;
-  session.exitCodeExpiry = Date.now() + 15 * 60 * 1000; // 15 mins to exit
+  session.exitCodeExpiry = Date.now() + EXIT_QR_TTL_S * 1000; // 20 menit sejak pembayaran
   session.payment = {
     method: paymentMethod,
     paidAt: now.toISOString(),
@@ -540,13 +823,54 @@ export async function processPayment({ sessionCode, paymentMethod = 'QRIS' }) {
   };
 
   await saveSession(session);
+  persistSession(session);
   await recordRevenue(session.zoneId, session.payment.amount, session.vehicleType);
   await publishEvent('PAYMENT_SUCCESS', { sessionCode, exitCode, amount: session.payment.amount });
   return session;
 }
 
+// Re-issue an expired exit QR for a paid session (15 minutes from now)
+export async function reissueExitCode({ sessionCode }) {
+  const session = await getSession(sessionCode);
+  if (!session) throw new Error('Sesi parkir tidak ditemukan');
+  if (session.status !== 'PAID') throw new Error(`Sesi belum lunas: ${session.status}`);
+
+  const expired = Boolean(session.exitCodeExpiry) && Date.now() > session.exitCodeExpiry;
+  const charged = expired ? EXIT_EXPIRED_PENALTY : 0;
+
+  if (session.exitCode) await redis.del(`parking:exit:${session.exitCode}`);
+
+  session.exitCode = `OUT-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
+  session.exitCodeExpiry = Date.now() + EXIT_QR_TTL_S * 1000;
+
+  if (expired) {
+    session.penaltyTotal = Number(session.penaltyTotal || 0) + charged;
+    session.penalties = [
+      ...(Array.isArray(session.penalties) ? session.penalties : []),
+      {
+        type: 'EXPIRED_EXIT_QR',
+        amount: charged,
+        paidAt: new Date().toISOString(),
+      },
+    ];
+    await recordPenalty(session.zoneId, charged);
+    await publishEvent('EXIT_QR_PENALTY_PAID', {
+      sessionCode,
+      amount: charged,
+      exitCode: session.exitCode,
+      zoneId: session.zoneId,
+    });
+  } else {
+    await publishEvent('EXIT_QR_REISSUED', { sessionCode, exitCode: session.exitCode });
+  }
+
+  await saveSession(session);
+  persistSession(session);
+  return { session, charged, penalty: charged > 0 };
+}
+
 // Gate Out exit processing with VLM plate verification
-export async function processGateOut({ exitCode, plateRead, manualPlateOverride }) {
+async function processGateOutInner({ exitCode, plateRead, manualPlateOverride }) {
   const sessionCode = await redis.get(`parking:exit:${exitCode}`);
   if (!sessionCode) throw new Error('QR/Kode keluar tidak valid atau sudah kedaluwarsa');
 
@@ -555,6 +879,11 @@ export async function processGateOut({ exitCode, plateRead, manualPlateOverride 
 
   if (session.status !== 'PAID') {
     throw new Error(`Status sesi belum lunas: ${session.status}`);
+  }
+
+  if (session.exitCodeExpiry && Date.now() > session.exitCodeExpiry) {
+    await redis.del(`parking:exit:${exitCode}`);
+    throw new Error('QR keluar sudah kedaluwarsa. Buka aplikasi driver dan bayar denda Rp20.000 untuk menerbitkan QR keluar baru.');
   }
 
   const rawPlate = manualPlateOverride || plateRead?.plate;
@@ -584,6 +913,8 @@ export async function processGateOut({ exitCode, plateRead, manualPlateOverride 
   await redis.srem('parking:active_sessions', sessionCode);
   await redis.del(`parking:exit:${exitCode}`);
 
+  await releaseBookingSlot(session);
+  persistSession(session);
   await recordActivity(session.zoneId, 'exits');
   if (manualPlateOverride) await recordActivity(session.zoneId, 'manualOverrides', { countActivity: false });
 
@@ -704,6 +1035,15 @@ export async function updateZone(id, { name, domainId, vehicleType, capacity, ga
 
 export async function deleteZone(id) {
   await initMasterData();
+
+  const activeCodes = await redis.smembers('parking:active_sessions');
+  for (const code of activeCodes) {
+    const session = await getSession(code);
+    if (session && session.zoneId === id) {
+      throw new Error('Zona masih memiliki sesi aktif. Selesaikan atau batalkan sesi tersebut dulu.');
+    }
+  }
+
   const zonesRaw = await redis.get('parking:master:zones');
   const zones = JSON.parse(zonesRaw || '[]');
 
@@ -737,4 +1077,188 @@ export async function adminOverrideGate({ gateType, zoneId, action = 'open', rea
     timestamp: new Date().toISOString(),
   });
   return { ok: true, gateType, zoneId, action, reason };
+}
+
+
+// Move a session to another zone. Allowed before gate entry (BOOKED) and once
+// after entry (ENTERED, before parking confirmation). Capacity is reserved
+// atomically on the new zone first, then the old reservation is released.
+export async function changeZone({ sessionCode, zoneId }) {
+  return withSessionLock(sessionCode, async () => {
+    const session = await getSession(sessionCode);
+    if (!session) throw new Error('Sesi parkir tidak ditemukan');
+
+    const allowed = ['BOOKED', 'ENTERED'];
+    if (!allowed.includes(session.status)) {
+      throw new Error(`Zona hanya bisa diubah sebelum konfirmasi parkir (status: ${session.status})`);
+    }
+    if (session.status === 'ENTERED' && Number(session.zoneChangesAfterEntry || 0) >= 1) {
+      throw new Error('Perpindahan zona setelah masuk gate hanya boleh satu kali.');
+    }
+    if (session.zoneId === zoneId) {
+      throw new Error('Zona tujuan sama dengan zona saat ini.');
+    }
+
+    const { zones } = await getZonesWithOccupancy();
+    const target = zones.find((z) => z.id === zoneId);
+    if (!target) throw new Error('Zona tujuan tidak ditemukan');
+    if (target.vehicleType && target.vehicleType !== session.vehicleType) {
+      throw new Error(
+        `Zona ${target.name} hanya untuk ${target.vehicleType === 'car' ? 'mobil' : 'motor'}.`
+      );
+    }
+
+    const bookingDate = session.bookingDate || new Date(session.etaTime).toISOString().slice(0, 10);
+    const reserved = await redis.eval(RESERVE_LUA, 1, counterKey(bookingDate, zoneId), target.capacity);
+    if (!reserved) throw new Error('Kuota zona tujuan sudah penuh.');
+
+    const previousZoneId = session.zoneId;
+    session.zoneId = zoneId;
+    session.domainId = target.domainId;
+    session.zoneChangedAt = new Date().toISOString();
+    session.zoneChangeCount = Number(session.zoneChangeCount || 0) + 1;
+    if (session.status === 'ENTERED') {
+      session.zoneChangesAfterEntry = Number(session.zoneChangesAfterEntry || 0) + 1;
+    }
+
+    try {
+      await saveSession(session);
+      await releaseBookingSlot({ ...session, zoneId: previousZoneId });
+    } catch (err) {
+      // roll back the new reservation if persistence fails
+      await redis.decr(counterKey(bookingDate, zoneId));
+      throw err;
+    }
+
+    persistSession(session);
+    await publishEvent('ZONE_CHANGED', {
+      sessionCode,
+      fromZoneId: previousZoneId,
+      toZoneId: zoneId,
+      status: session.status,
+    });
+    await publishEvent('ZONE_UPDATED', await getZonesWithOccupancy());
+    return session;
+  });
+}
+
+/* ------------------------- locked transition wrappers ------------------------- */
+
+export async function processGateIn(args) {
+  return withSessionLock(args.sessionCode, () => processGateInInner(args));
+}
+
+export async function processZoneScan(args) {
+  return withSessionLock(args.sessionCode, () => processZoneScanInner(args));
+}
+
+export async function processPayment(args) {
+  return withSessionLock(args.sessionCode, () => processPaymentInner(args));
+}
+
+export async function processGateOut(args) {
+  const sessionCode = await redis.get(`parking:exit:${args.exitCode}`);
+  if (!sessionCode) throw new Error('QR/Kode keluar tidak valid atau sudah kedaluwarsa');
+  return withSessionLock(sessionCode, () => processGateOutInner(args));
+}
+
+// Start checkout from the app without re-scanning the zone QR.
+// The session is already locked to its booked zone; the server uses that zone.
+export async function requestCheckout({ sessionCode }) {
+  return withSessionLock(sessionCode, async () => {
+    const session = await getSession(sessionCode);
+    if (!session) throw new Error('Sesi parkir tidak ditemukan');
+    return processZoneScanInner({
+      sessionCode,
+      scannedZoneId: session.zoneId,
+      action: 'checkout',
+    });
+  });
+}
+
+// Cancel a booking that has not entered the gate yet
+export async function cancelBooking({ sessionCode }) {
+  return withSessionLock(sessionCode, async () => {
+    const session = await getSession(sessionCode);
+    if (!session) throw new Error('Sesi parkir tidak ditemukan');
+    if (session.status !== 'BOOKED') {
+      throw new Error(`Hanya booking yang belum masuk gate bisa dibatalkan (status: ${session.status})`);
+    }
+
+    session.status = 'CANCELLED';
+    session.cancelledAt = new Date().toISOString();
+    await saveSession(session);
+    await redis.srem('parking:active_sessions', sessionCode);
+    await releaseBookingSlot(session);
+    persistSession(session);
+    await publishEvent('BOOKING_CANCELLED', { sessionCode, zoneId: session.zoneId });
+    await publishEvent('ZONE_UPDATED', await getZonesWithOccupancy());
+    return session;
+  });
+}
+
+// Expire bookings whose entry QR has lapsed. Safe to run repeatedly.
+export async function sweepExpiredBookings() {
+  const codes = await redis.smembers('parking:active_sessions');
+  let expired = 0;
+  for (const code of codes) {
+    const session = await getSession(code);
+    if (!session || session.status !== 'BOOKED' || !checkSessionExpired(session)) continue;
+
+    try {
+      await withSessionLock(code, async () => {
+        const fresh = await getSession(code);
+        if (!fresh || fresh.status !== 'BOOKED' || !checkSessionExpired(fresh)) return;
+        fresh.status = 'EXPIRED';
+        fresh.expiredReason = 'QR masuk kedaluwarsa (15 menit dari ETA)';
+        await saveSession(fresh);
+        await redis.srem('parking:active_sessions', code);
+        await releaseBookingSlot(fresh);
+        persistSession(fresh);
+        await publishEvent('SESSION_EXPIRED', { sessionCode: code, zoneId: fresh.zoneId });
+        expired += 1;
+      });
+    } catch {
+      // another worker owns the lock; skip this round
+    }
+  }
+  if (expired > 0) await publishEvent('ZONE_UPDATED', await getZonesWithOccupancy());
+  return expired;
+}
+
+// Rebuild per-date counters from active sessions (run at boot for consistency)
+export async function rebuildCounters() {
+  const codes = await redis.smembers('parking:active_sessions');
+  const counts = new Map();
+  for (const code of codes) {
+    const session = await getSession(code);
+    if (!session) continue;
+    if (!['BOOKED', 'ENTERED', 'PARKED_CONFIRMED', 'CHECKOUT_REQUESTED', 'PAID'].includes(session.status)) continue;
+    const day = session.bookingDate || (session.etaTime ? new Date(session.etaTime).toISOString().slice(0, 10) : null);
+    if (!day) continue;
+    const key = counterKey(day, session.zoneId);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const existing = await redis.keys('parking:count:*');
+  if (existing.length) await redis.del(...existing);
+  for (const [key, value] of counts.entries()) {
+    await redis.set(key, value, 'EX', 172800);
+  }
+  return counts.size;
+}
+
+let schedulerTimer = null;
+
+export function startScheduler(intervalMs = 30000) {
+  if (schedulerTimer) return schedulerTimer;
+  schedulerTimer = setInterval(() => {
+    sweepExpiredBookings().catch((err) => console.error('[scheduler]', err?.message || err));
+  }, intervalMs);
+  if (typeof schedulerTimer.unref === 'function') schedulerTimer.unref();
+  return schedulerTimer;
+}
+
+export function stopScheduler() {
+  if (schedulerTimer) clearInterval(schedulerTimer);
+  schedulerTimer = null;
 }
