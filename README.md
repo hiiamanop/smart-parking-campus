@@ -1,175 +1,169 @@
-# Smart Parking Campus
+# Smart Parking Kampus
 
-Sistem Smart Parking kampus dengan tiga aplikasi web terpisah:
+Sistem parkir kampus: booking zona, QR masuk/keluar, pembacaan plat nomor dengan VLM, pembayaran di aplikasi, dan pemantauan realtime.
 
-| App | Untuk | Subdomain |
-|---|---|---|
-| `client/` | **Driver** — booking, tiket QR, bayar, tiket keluar | `parkir.hiiamanop.my.id` |
-| `app/` | **Admin** — kelola zona, QR tiang, monitoring sesi, override gate | `admin-parkir.hiiamanop.my.id` |
-| `gate/` | **Gate kiosk** — scan QR + VLM baca plat, buka palang | `gate-parkir.hiiamanop.my.id` |
+Tiga aplikasi web + satu backend:
 
-Backend `server/` menyediakan REST API + SSE live events + proxy VLM OpenRouter, dengan state live di **Redis**.
+| Folder | Aplikasi | Port dev | Isi |
+|---|---|---|---|
+| `client/` | Driver (mobile web, PWA) | 5174 | Cari slot, booking, tiket QR, bayar, QR keluar |
+| `app/` | Admin dashboard | 5173 | Login, ringkasan, CRUD domain/zona, QR zona, analitik, sesi, audit log, asisten operator |
+| `gate/` | Kiosk gate | 5175 | Kamera aktif: scan QR lalu baca plat (VLM), buka palang |
+| `server/` | REST API + SSE | 8788 | State machine parkir di Redis, proxy OpenRouter, histori |
 
 ## Arsitektur
 
 ```text
 Browser (driver / admin / gate)
-   │  same-origin: /api/*  (proxied)
+   │  /api/*  (Vite dev proxy atau container proxy)
    ▼
-smart-parking-web (static + proxy)  ──► smart-parking-api (Node, :8788)
-                                            ├─ Redis (state sesi, zona, event)
-                                            └─ OpenRouter (VLM plat nomor)
-   ▲
-   │
-Cloudflare Tunnel ── parkir / admin-parkir / gate-parkir .hiiamanop.my.id
+smart-parking-api (Node http, :8788)
+   ├─ Redis      sesi, master data, counter kuota, event, statistik
+   └─ OpenRouter VLM plat nomor + asisten operator
 ```
 
-- Tiga container web memakai image yang sama; beda hanya `APP_DIR`.
-- `/api/*` diproxy ke `smart-parking-api`, termasuk SSE `/api/events` (streaming).
-- **API key OpenRouter hanya di server**, tidak dikirim ke browser.
+- API key OpenRouter hanya di server.
+- Live update memakai Redis Pub/Sub → SSE `/api/events` (semua app + browser).
 
-## Struktur
+## Alur utama
 
 ```text
-smart-parking/
-├── app/                  # Dashboard admin (Vite + React + TS)
-├── client/               # Driver app (PWA installable)
-├── gate/                 # Gate kiosk (kamera + QR + VLM)
-├── server/
-│   ├── server.mjs        # REST + SSE + VLM proxy
-│   ├── store.mjs         # state machine parkir (Redis)
-│   ├── web.mjs           # static server + proxy /api untuk 3 app
-│   └── test-store.mjs    # self-test backend
-├── deploy/
-│   ├── api.Dockerfile
-│   └── web.Dockerfile
-├── docker-compose.yml    # redis + api + driver + admin + gate
-├── supabase/schema.sql   # skema iterasi awal (belum dipakai backend ini)
-└── docs/
+Driver booking (zona, kendaraan, ETA)
+        │  status BOOKED, QR sesi SP-xxxxxxxxxxxxxxxx
+        ▼
+Gate masuk: scan QR + kamera baca plat (VLM) -> ENTERED, palang buka
+        ▼
+Di zona: scan QR tiang zona -> PARKED_CONFIRMED
+        ▼
+Pulang: tombol di app -> CHECKOUT_REQUESTED (tanpa scan QR zona)
+        ▼
+Bayar di app -> PAID + QR keluar OUT-xxxxxxxx (berlaku 20 menit)
+        ▼
+Gate keluar: scan QR keluar + verifikasi plat -> COMPLETED
 ```
 
-## Setup
+Aturan penting:
 
-1. `.env` (lihat `.env.example`):
+- **QR masuk** berlaku 15 menit sejak ETA. Lewat itu booking dianggap hangus (scheduler melepas kuota).
+- **QR keluar** berlaku 20 menit sejak pembayaran. Bila kedaluwarsa, driver menerbitkan QR baru dari HP dengan **denda Rp20.000**.
+- **Zona**: hanya zona yang dipesan boleh dikonfirmasi. Salah scan pertama = peringatan; salah scan kedua = pelanggaran tercatat.
+- **Ganti zona**: boleh kapan saja sebelum masuk gate, dan **satu kali** setelah masuk gate.
+- **Batal booking**: hanya saat status `BOOKED`; kuota dikembalikan.
+- **Pembayaran tidak butuh scan QR zona lagi** — checkout dari tombol di app.
 
-   ```env
-   OPENROUTER_API_KEY=sk-or-...
-   OPENROUTER_VLM_MODEL=google/gemini-3.5-flash
-   REDIS_URL=redis://127.0.0.1:6379
-   ```
+## Tarif
 
-2. Redis lokal:
+Berjenjang per kendaraan dan durasi (dihitung dari waktu masuk):
 
-   ```bash
-   docker run -d --name redis-parking -p 6379:6379 redis:alpine
-   ```
-
-3. Install & jalankan backend:
-
-   ```bash
-   cd server && npm install && npm start
-   # health: http://127.0.0.1:8788/health
-   # tes:   cd server && node test-store.mjs
-   ```
-
-4. Jalankan frontend (terminal terpisah):
-
-   ```bash
-   cd app    && npm install && npm run dev   # admin,  http://localhost:5173
-   cd client && npm install && npm run dev   # driver, http://localhost:5174
-   cd gate   && npm install && npm run dev   # kiosk,  http://localhost:5175
-   ```
-
-   Vite memproxy `/api` ke `127.0.0.1:8788`.
-
-## Build & deploy
-
-```bash
-npm run build          # build app + client + gate
-docker compose up -d --build
-```
-
-Container:
-
-| Container | Port lokal | Fungsi |
+| Kendaraan | < 60 menit | ≥ 60 menit |
 |---|---|---|
-| `smart-parking-api` | `127.0.0.1:8788` | REST + SSE + VLM |
-| `smart-parking-driver` | `127.0.0.1:8081` | Driver app |
-| `smart-parking-admin` | `127.0.0.1:8082` | Admin dashboard |
-| `smart-parking-gate` | `127.0.0.1:8083` | Gate kiosk |
-| `smart-parking-redis` | internal | State live (AOF volume) |
+| Motor | Rp1.000 | Rp2.000 |
+| Mobil | Rp2.000 | Rp3.000 |
 
-Semua container join network `supabase_default` agar bisa diakses `cloudflared` dan (opsional) database Supabase.
+Denda QR keluar kedaluwarsa: **Rp20.000**.
 
-### Ingress Cloudflare
+## Status sesi
 
-`storage/volumes/cloudflared/config.yml`:
+`BOOKED → ENTERED → PARKED_CONFIRMED → CHECKOUT_REQUESTED → PAID → COMPLETED`
 
-```yaml
-ingress:
-  - hostname: storage.hiiamanop.my.id
-    service: http://api-gw:8000
-  - hostname: parkir.hiiamanop.my.id
-    service: http://smart-parking-driver:8080
-  - hostname: admin-parkir.hiiamanop.my.id
-    service: http://smart-parking-admin:8080
-  - hostname: gate-parkir.hiiamanop.my.id
-    service: http://smart-parking-gate:8080
-  - service: http_status:404
-```
+Status lain: `EXPIRED` (booking hangus), `CANCELLED` (dibatalkan driver/admin).
 
-DNS (zone `hiiamanop.my.id`), semua **CNAME** ke `efa3575e-ce9a-400c-ab75-c9edb521479e.cfargotunnel.com`, **Proxied**:
+## Setup lokal
 
-- `parkir`
-- `admin-parkir`
-- `gate-parkir`
-
-## Alur singkat
-
-1. Driver booking (fakultas, zona, ETA) → QR sesi `SP-xxxxxx`.
-2. Gate masuk: scan QR + foto plat → VLM baca plat → sesi `ENTERED`, palang terbuka.
-3. Zona: scan QR zona → `PARKED_CONFIRMED`.
-4. Mau pulang: scan QR zona → `CHECKOUT_REQUESTED` + bill.
-5. Bayar di app (QRIS simulasi) → `PAID` + kode keluar `OUT-xxxxxx`.
-6. Gate keluar: scan kode keluar + foto plat → VLM verifikasi plat → `COMPLETED`.
-
-## Catatan status
-
-- Pembayaran & palang gate masih **simulasi**.
-- Backend saat ini memakai **Redis** untuk state live. Skema Supabase dari iterasi awal (`supabase/schema.sql`) belum diwire ke backend ini.
-- Tarif masih flat **Rp2.000**; aturan overstay (Rp2.000 + Rp1.000) dan loyalty belum diimplementasikan di backend branch ini.
-- VLM butuh `OPENROUTER_API_KEY`; tanpa key, gunakan override plat manual di gate kiosk.
-- Scan QR kamera: gate memakai `jsQR`; browser modern/HTTPS.
-
-## Dokumen
-
-- [User Story](docs/user-story.md)
-- [Product Backlog](docs/backlog.md)
-- [BRD](docs/brd.md)
-
-## Keamanan & operasi (P0/P1)
-
-Variabel `.env` tambahan:
+Prasyarat: Node 24+, Redis (Docker/OrbStack).
 
 ```bash
-# Wajib untuk produksi. Jika kosong, API admin/gate terbuka (hanya untuk dev).
-ADMIN_API_TOKEN=ganti-token-admin-panjang
-GATE_API_TOKEN=ganti-token-gate-panjang
+# 1. Redis
+docker run -d --name redis-parking -p 6379:6379 redis:alpine
 
-# Opsional: arsip historis ke Supabase/Postgres
-SUPABASE_URL=https://xxxx.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=service-role-key
-SUPABASE_TABLE=parking_history
+# 2. Env (root .env, tidak di-commit)
+cp .env.example .env   # isi OPENROUTER_API_KEY, REDIS_URL, token
+
+# 3. Backend
+npm run dev:server     # http://127.0.0.1:8788/health
+
+# 4. Frontend (terminal terpisah / background)
+npm run dev:admin      # http://localhost:5173
+npm run dev:client     # http://localhost:5174
+npm run dev:gate       # http://localhost:5175
+```
+
+Vite memproxy `/api` ke `127.0.0.1:8788`.
+
+### Variabel `.env`
+
+```env
+# WAJIB
+OPENROUTER_API_KEY=sk-or-...
+REDIS_URL=redis://127.0.0.1:6379
+
+# Model (dipakai VLM plat dan asisten operator)
+OPENROUTER_VLM_MODEL=google/gemini-3.5-flash
+
+# Token akses. Kosong = API terbuka (hanya untuk dev)
+ADMIN_API_TOKEN=token-admin-panjang
+GATE_API_TOKEN=token-gate-panjang
 
 # Opsional
 VLM_TIMEOUT_MS=20000
+ASSISTANT_TIMEOUT_MS=30000
 HISTORY_DIR=./data/history
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+SUPABASE_TABLE=parking_history
 ```
 
-- **Admin**: dashboard meminta token saat pertama dibuka (`ADMIN_API_TOKEN`).
-- **Gate**: terminal kios meminta token perangkat (`GATE_API_TOKEN`) atau `VITE_GATE_TOKEN` saat build.
-- **Rate limit** bawaan: VLM 30/menit, tulis 30/menit, baca 180/menit per IP/token.
-- **Health**: `GET /health` memeriksa Redis. **Metrik**: `GET /metrics` (format Prometheus).
-- **Histori**: setiap perubahan status sesi ditulis ke `data/history/YYYY-MM-DD.jsonl`; bila Supabase dikonfigurasi, juga dikirim ke tabel `parking_history` (lihat `supabase/history.sql`).
-- **Kedaluwarsa**: scheduler internal berjalan tiap 30 detik untuk melepas booking yang hangus.
-- **Tes terisolasi**: `npm --prefix server test` memakai Redis DB 15, server sementara di port 8799, dan token tes. CI: `.github/workflows/ci.yml`.
+## Build, tes, deploy
+
+```bash
+npm run build          # build app + client + gate
+npm run test:server    # store + consensus + API (Redis DB 15, port 8799)
+docker compose up -d --build
+```
+
+| Container | Port lokal | Fungsi |
+|---|---|---|
+| `smart-parking-api` | 8788 | REST + SSE + VLM |
+| `smart-parking-driver` | 8081 | Driver app |
+| `smart-parking-admin` | 8082 | Admin dashboard |
+| `smart-parking-gate` | 8083 | Gate kiosk |
+| `smart-parking-redis` | internal | State live (AOF) |
+
+Ingress Cloudflare: `parkir.` → driver, `admin-parkir.` → admin, `gate-parkir.` → gate.
+
+## Keamanan & operasi
+
+- Route `/api/admin/*`, mutasi domain/zona, `/api/gates/*`, `/api/vlm/*` dijaga bearer token.
+- Rate limit: VLM 30/menit, tulis 30/menit, baca 180/menit per IP/token.
+- `GET /health` (Redis ping), `GET /metrics` (Prometheus), log JSON terstruktur.
+- Histori: `data/history/YYYY-MM-DD.jsonl`; opsional upsert Supabase `parking_history` (`supabase/history.sql`).
+- Scheduler 30 detik melepas booking `BOOKED` yang lewat ETA + 15 menit.
+- Kuota zona diamankan dengan Lua `INCR` atomik + lock per sesi.
+
+## Struktur repo
+
+```text
+app/        Dashboard admin (React 19 + Vite + TS)
+client/     Driver app (React 19 + Vite + TS, PWA)
+gate/       Gate kiosk (React 19 + Vite + TS, jsQR + ONNX plate detector)
+assets/     Logo sumber (lencana + ikon chatbot)
+server/     API, state machine, VLM, persistence
+deploy/     Dockerfile api + web
+supabase/   history.sql (dipakai), schema.sql (arsip iterasi awal)
+docs/       BRD, user story, backlog
+```
+
+## Dokumentasi per sisi
+
+- [Admin dashboard](app/README.md)
+- [Driver app](client/README.md)
+- [Gate kiosk](gate/README.md)
+- [Backend API](server/README.md)
+- [BRD](docs/brd.md) · [User Story](docs/user-story.md) · [Backlog](docs/backlog.md)
+
+## Batasan saat ini
+
+- Pembayaran QRIS masih simulasi (tanpa gateway).
+- Palang gate fisik belum diintegrasikan; status palang hanya di layar kiosk.
+- Identitas driver belum ada autentikasi (cukup nama pada booking).
+- Asisten operator memakai model yang sama dengan VLM; perubahan data selalu perlu persetujuan operator di UI.
