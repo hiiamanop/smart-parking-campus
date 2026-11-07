@@ -1,4 +1,4 @@
-# Smart Parking Kampus
+# Smart Parking Campus
 
 Proyek **Smart Parking** untuk mengatasi masalah parkir di kampus (lapangan *outdoor*, banyak fakultas/zona): pengguna sudah melihat *counter* ketersediaan, tetapi belum tahu **lokasi/area kosong** dan ingin parkir di **zona dekat fakultasnya**.
 
