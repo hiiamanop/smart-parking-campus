@@ -12,6 +12,8 @@ export function SessionMonitor({ zones, lastUpdateTimestamp }: SessionMonitorPro
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [fromDate, setFromDate] = useState<string>('');
+  const [toDate, setToDate] = useState<string>('');
 
   const loadSessions = () => {
     setLoading(true);
@@ -30,15 +32,19 @@ export function SessionMonitor({ zones, lastUpdateTimestamp }: SessionMonitorPro
     return () => clearInterval(iv);
   }, [lastUpdateTimestamp]);
 
-  const filtered = filterStatus === 'all'
-    ? sessions
-    : sessions.filter((s) => s.status === filterStatus);
+  const filtered = sessions.filter((s) => {
+    if (filterStatus !== 'all' && s.status !== filterStatus) return false;
+    const day = String(s.createdAt || '').slice(0, 10);
+    if (fromDate && day < fromDate) return false;
+    if (toDate && day > toDate) return false;
+    return true;
+  });
 
   // Stats calculation
   const totalActive = sessions.length;
   const parkedCount = sessions.filter((s) => s.status === 'PARKED_CONFIRMED').length;
   const waitingPayCount = sessions.filter((s) => s.status === 'CHECKOUT_REQUESTED').length;
-  const overstayCount = sessions.filter((s) => s.bill?.isOverstay).length;
+  const paidCount = sessions.filter((s) => s.status === 'PAID').length;
 
   const getStatusBadge = (status: string) => {
     switch (status) {
@@ -64,7 +70,7 @@ export function SessionMonitor({ zones, lastUpdateTimestamp }: SessionMonitorPro
   return (
     <div className="admin-session-monitor">
       {/* Metric Cards */}
-      <div className="grid mb-4">
+      <div className="stat-strip mb-4">
         <div className="card stat-card">
           <small>Total Sesi Aktif</small>
           <strong className="stat-num">{totalActive}</strong>
@@ -81,20 +87,31 @@ export function SessionMonitor({ zones, lastUpdateTimestamp }: SessionMonitorPro
           <small className="hint-text">Tagihan diterbitkan</small>
         </div>
         <div className="card stat-card">
-          <small>Pelanggaran Overstay</small>
-          <strong className="stat-num err">{overstayCount}</strong>
-          <small className="hint-text">Melebihi batas ETD (+Rp1.000)</small>
+          <small>Sudah lunas</small>
+          <strong className="stat-num ok">{paidCount}</strong>
+          <small className="hint-text">Menunggu verifikasi gate keluar</small>
         </div>
       </div>
 
-      <div className="section-header row" style={{ justifyContent: 'space-between', marginBottom: 12 }}>
-        <div>
-          <h2>Monitoring Live Kendaraan &amp; Sesi Parkir</h2>
-          <p className="hint-text" style={{ margin: 0 }}>
-            Pantau seluruh kendaraan di area kampus secara real-time via Redis Pub/Sub stream.
-          </p>
-        </div>
+      <div className="page-toolbar">
         <div className="row">
+          <input
+            type="date"
+            value={fromDate}
+            max={toDate || undefined}
+            onChange={(e) => setFromDate(e.target.value)}
+            style={{ width: 'auto' }}
+            title="Dari tanggal"
+          />
+          <span className="hint-text" style={{ margin: 0 }}>sampai</span>
+          <input
+            type="date"
+            value={toDate}
+            min={fromDate || undefined}
+            onChange={(e) => setToDate(e.target.value)}
+            style={{ width: 'auto' }}
+            title="Sampai tanggal"
+          />
           <select
             value={filterStatus}
             onChange={(e) => setFilterStatus(e.target.value)}
@@ -163,7 +180,7 @@ export function SessionMonitor({ zones, lastUpdateTimestamp }: SessionMonitorPro
                         {s.bill ? (
                           <span>
                             Rp{s.bill.total.toLocaleString()}
-                            {s.bill.isOverstay ? <span className="err"> (Overstay)</span> : ''}
+                            {s.penaltyTotal ? <span className="err"> (+denda Rp{s.penaltyTotal.toLocaleString('id-ID')})</span> : ''}
                           </span>
                         ) : (
                           <small className="hint-text">-</small>

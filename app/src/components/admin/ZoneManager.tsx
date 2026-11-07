@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { Domain, Zone } from '../../types';
-import { createZoneApi, updateZoneApi, deleteZoneApi } from '../../lib/api';
+import { createZoneApi, updateZoneApi, deleteZoneApi, fetchAdminSessions } from '../../lib/api';
+import type { ParkingSession } from '../../types';
 
 interface ZoneManagerProps {
   domains: Domain[];
@@ -23,6 +24,27 @@ export function ZoneManager({ domains, zones, onRefresh }: ZoneManagerProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+
+  // Zone detail modal (active sessions + plates)
+  const [detailZone, setDetailZone] = useState<Zone | null>(null);
+  const [detailSessions, setDetailSessions] = useState<ParkingSession[]>([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+
+  const openDetail = (zone: Zone) => {
+    setDetailZone(zone);
+    setDetailSessions([]);
+    setDetailError(null);
+    loadZoneSessions(zone);
+  };
+
+  const loadZoneSessions = (zone: Zone) => {
+    setDetailLoading(true);
+    fetchAdminSessions()
+      .then((all) => setDetailSessions(all.filter((s) => s.zoneId === zone.id)))
+      .catch((err) => setDetailError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setDetailLoading(false));
+  };
 
   const handleOpenAdd = () => {
     setName('');
@@ -104,14 +126,7 @@ export function ZoneManager({ domains, zones, onRefresh }: ZoneManagerProps) {
 
   return (
     <div className="admin-zone-manager">
-      <div className="section-header row" style={{ justifyContent: 'space-between', marginBottom: 14 }}>
-        <div>
-          <h2>Manajemen Master Data Zona Parkir</h2>
-          <p className="hint-text" style={{ margin: 0 }}>
-            Kelola kapasitas, lokasi fakultas terkait, dan gate untuk masing-masing area parkir outdoor.
-          </p>
-        </div>
-        <button
+      <div className="page-toolbar">        <button
           type="button"
           className="btn btn-primary"
           onClick={() => {
@@ -271,6 +286,13 @@ export function ZoneManager({ domains, zones, onRefresh }: ZoneManagerProps) {
                         <button
                           type="button"
                           className="secondary btn-sm"
+                          onClick={() => openDetail(z)}
+                        >
+                          Detail
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary btn-sm"
                           onClick={() => handleOpenEdit(z)}
                         >
                           Edit
@@ -292,6 +314,96 @@ export function ZoneManager({ domains, zones, onRefresh }: ZoneManagerProps) {
           </table>
         </div>
       </section>
+
+      {detailZone && (
+        <div className="modal-backdrop" onClick={() => setDetailZone(null)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div>
+                <h3>{detailZone.name}</h3>
+                <p className="hint-text" style={{ margin: 0 }}>
+                  {domains.find((d) => d.id === detailZone.domainId)?.name || detailZone.domainId} ·{' '}
+                  {detailZone.vehicleType === 'car' ? 'Mobil' : 'Motor'} · {detailZone.occupied}/
+                  {detailZone.capacity} terisi
+                </p>
+              </div>
+              <div className="row" style={{ gap: 6 }}>
+                <button
+                  type="button"
+                  className="secondary btn-sm"
+                  onClick={() => loadZoneSessions(detailZone)}
+                  disabled={detailLoading}
+                >
+                  {detailLoading ? 'Memuat…' : 'Segarkan'}
+                </button>
+                <button type="button" className="icon-close" onClick={() => setDetailZone(null)}>
+                  Tutup
+                </button>
+              </div>
+            </div>
+
+            {detailError && <div className="alert alert-err">{detailError}</div>}
+
+            {detailSessions.length === 0 ? (
+              <p className="hint-text" style={{ padding: '18px 0', textAlign: 'center' }}>
+                {detailLoading ? 'Memuat sesi aktif…' : 'Tidak ada sesi aktif di zona ini.'}
+              </p>
+            ) : (
+              <div className="table-scroll table-scroll-10">
+                <table className="admin-table">
+                  <thead>
+                    <tr>
+                      <th>Kode</th>
+                      <th>Plat</th>
+                      <th>Status</th>
+                      <th>Pengemudi</th>
+                      <th>Masuk</th>
+                      <th>Tagihan</th>
+                      <th>QR keluar</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {detailSessions.map((sess) => (
+                      <tr key={sess.sessionCode}>
+                        <td>
+                          <code>{sess.sessionCode}</code>
+                        </td>
+                        <td>
+                          {sess.plate ? <span className="plate-badge">{sess.displayPlate || sess.plate}</span> : <span className="hint-text">—</span>}
+                        </td>
+                        <td>
+                          <span className={`status-badge badge-${String(sess.status).toLowerCase()}`}>
+                            {sess.status}
+                          </span>
+                        </td>
+                        <td>{sess.userName}</td>
+                        <td>
+                          <small>
+                            {sess.entryTime
+                              ? new Date(sess.entryTime).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })
+                              : `ETA ${sess.eta}`}
+                          </small>
+                        </td>
+                        <td>{sess.bill ? `Rp${sess.bill.total.toLocaleString('id-ID')}` : '—'}</td>
+                        <td>
+                          {sess.exitCode ? (
+                            <small className="nowrap">
+                              {sess.exitCode}
+                              {sess.exitCodeExpiry && Date.now() > sess.exitCodeExpiry ? ' (kedaluwarsa)' : ''}
+                            </small>
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

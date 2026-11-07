@@ -36,6 +36,12 @@ interface ParkingSession {
   checkoutTime?: string;
   exitTime?: string;
   exitCode?: string;
+  entryQrExpiresAt?: number;
+  exitCodeExpiry?: number;
+  zoneChangedAt?: string;
+  zoneChangeCount?: number;
+  zoneChangesAfterEntry?: number;
+  zoneScanMisses?: number;
   bill?: {
     baseFee: number;
     penaltyFee: number;
@@ -420,7 +426,7 @@ function ExploreView({
                   </div>
                 </div>
 
-                <div className="meter">
+                <div className="meter" title={`${z.occupied}/${z.capacity} terisi (${ratio}%)`}>
                   <div className={`meter-fill ${z.isFull ? 'full' : ''}`} style={{ width: `${ratio}%` }} />
                 </div>
 
@@ -518,6 +524,13 @@ function TimelineTicketView({
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [zoneQr, setZoneQr] = useState('');
+  const [changeZoneId, setChangeZoneId] = useState('');
+  const [nowMs, setNowMs] = useState(Date.now());
+
+  useEffect(() => {
+    const iv = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(iv);
+  }, []);
 
   useEffect(() => {
     const code = activeSession?.exitCode || activeSession?.sessionCode;
@@ -556,6 +569,16 @@ function TimelineTicketView({
     const match = value.match(/CAMPUS-ZONE-(.+)$/i);
     return match ? match[1].trim() : value;
   };
+
+  const canChangeZone =
+    activeSession?.status === 'BOOKED' ||
+    (activeSession?.status === 'ENTERED' && !activeSession.zoneChangesAfterEntry);
+  const changeableZones = zones.filter(
+    (z) =>
+      z.id !== activeSession?.zoneId &&
+      !z.isFull &&
+      ((z.vehicleType || 'motorcycle') === (activeSession?.vehicleType || 'motorcycle'))
+  );
 
   const handleZoneAction = async (action: 'confirm_park' | 'checkout') => {
     if (!activeSession) return;
@@ -605,6 +628,103 @@ function TimelineTicketView({
     }
   };
 
+  const remaining = (ts?: number) => {
+    if (!ts) return null;
+    const sec = Math.max(0, Math.floor((ts - nowMs) / 1000));
+    return { sec, text: `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}` };
+  };
+
+  const handleChangeZone = async () => {
+    if (!activeSession || !changeZoneId) return;
+    setLoading(true);
+    setStatusMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bookings/change-zone`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: activeSession.sessionCode, zoneId: changeZoneId }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal memindahkan zona');
+      onUpdateSession(data.session);
+      setChangeZoneId('');
+      setStatusMsg({ ok: true, text: 'Zona berhasil dipindahkan. Kode tiket tetap sama.' });
+    } catch (e: any) {
+      setStatusMsg({ ok: false, text: e.message || String(e) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCheckoutRequest = async () => {
+    if (!activeSession) return;
+    setLoading(true);
+    setStatusMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/payments/checkout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: activeSession.sessionCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal membuat tagihan');
+      onUpdateSession(data.session);
+    } catch (e: any) {
+      setStatusMsg({ ok: false, text: e.message || String(e) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCancelBooking = async () => {
+    if (!activeSession) return;
+    if (!confirm('Batalkan booking ini?')) return;
+    setLoading(true);
+    setStatusMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bookings/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: activeSession.sessionCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal membatalkan booking');
+      onUpdateSession(null);
+      onGoToExplore();
+    } catch (e: any) {
+      setStatusMsg({ ok: false, text: e.message || String(e) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleReissueExit = async () => {
+    if (!activeSession) return;
+    setLoading(true);
+    setStatusMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/payments/reissue`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: activeSession.sessionCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal menerbitkan QR baru');
+      onUpdateSession(data.session);
+      setStatusMsg({
+        ok: true,
+        text:
+          data.charged > 0
+            ? `Denda ${formatRupiah(data.charged)} dibayar. QR keluar baru berlaku 20 menit.`
+            : 'QR keluar baru diterbitkan, berlaku 20 menit.',
+      });
+    } catch (e: any) {
+      setStatusMsg({ ok: false, text: e.message || String(e) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
   if (!activeSession) {
     return (
       <div className="empty-state tall">
@@ -625,7 +745,7 @@ function TimelineTicketView({
             Kembali
           </button>
           <span className="page-nav-title">Tiket parkir</span>
-          <button type="button" className="icon-nav" onClick={() => onUpdateSession(null)}>
+          <button type="button" className="icon-nav" onClick={handleCancelBooking} disabled={loading}>
             Batalkan
           </button>
         </div>
@@ -670,6 +790,18 @@ function TimelineTicketView({
             </div>
             <div className="ticket-code-label">Nomor tiket</div>
             <div className="ticket-code">#{activeSession.sessionCode}</div>
+
+            {(() => {
+              const r = remaining(activeSession.entryQrExpiresAt);
+              if (!r) return null;
+              return (
+                <div className={`expiry-line ${r.sec === 0 ? 'expired' : ''}`}>
+                  {r.sec === 0
+                    ? 'QR masuk kedaluwarsa — booking hangus.'
+                    : `QR masuk berlaku ${r.text} (15 menit sejak ETA)`}
+                </div>
+              );
+            })()}
           </div>
         </div>
 
@@ -690,12 +822,7 @@ function TimelineTicketView({
         <button
           type="button"
           className="icon-nav"
-          onClick={() => {
-            if (confirm('Batalkan sesi ini?')) {
-              onUpdateSession(null);
-              onGoToExplore();
-            }
-          }}
+          onClick={handleCancelBooking}
         >
           Batalkan
         </button>
@@ -749,7 +876,7 @@ function TimelineTicketView({
         </div>
       </dl>
 
-      {(activeSession.status === 'ENTERED' || activeSession.status === 'PARKED_CONFIRMED') && (
+      {activeSession.status === 'ENTERED' && (
         <label className="field-label">
           Kode QR zona yang dipindai
           <input
@@ -760,6 +887,43 @@ function TimelineTicketView({
             onChange={(e) => setZoneQr(e.target.value)}
           />
         </label>
+      )}
+
+      {canChangeZone && (
+        <div className="zone-change-box">
+          <div className="zone-change-title">Salah pilih zona?</div>
+          {changeableZones.length === 0 ? (
+            <p className="action-hint">Tidak ada zona lain yang tersedia untuk kendaraan ini.</p>
+          ) : (
+            <>
+              <select
+                className="time-input"
+                value={changeZoneId}
+                onChange={(e) => setChangeZoneId(e.target.value)}
+              >
+                <option value="">Pilih zona lain…</option>
+                {changeableZones.map((z) => (
+                  <option key={z.id} value={z.id}>
+                    {z.name} · {z.available} slot
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="btn-cta-sub"
+                disabled={!changeZoneId || loading}
+                onClick={handleChangeZone}
+              >
+                {loading ? 'Memindahkan…' : 'Pindahkan ke zona ini'}
+              </button>
+              <p className="field-hint">
+                {activeSession.status === 'ENTERED'
+                  ? 'Setelah masuk gate, perpindahan hanya boleh satu kali dan tetap harus konfirmasi di tiang zona baru.'
+                  : 'Kode tiket tidak berubah; cukup pindai QR di zona baru saat tiba.'}
+              </p>
+            </>
+          )}
+        </div>
       )}
 
       {activeSession.status === 'ENTERED' && (
@@ -774,9 +938,12 @@ function TimelineTicketView({
       )}
 
       {activeSession.status === 'PARKED_CONFIRMED' && (
-        <button type="button" className="btn-primary-block" disabled={loading} onClick={() => handleZoneAction('checkout')}>
-          {loading ? 'Memproses…' : 'Selesai parkir'}
-        </button>
+        <div>
+          <p className="action-hint">Tidak perlu memindai QR zona lagi untuk pulang.</p>
+          <button type="button" className="btn-primary-block" disabled={loading} onClick={handleCheckoutRequest}>
+            {loading ? 'Menghitung tagihan…' : 'Lanjut ke pembayaran'}
+          </button>
+        </div>
       )}
 
       {activeSession.status === 'CHECKOUT_REQUESTED' && (
@@ -796,6 +963,24 @@ function TimelineTicketView({
             <div className="ticket-code-label">QR keluar</div>
             <div className="ticket-code small">{activeSession.exitCode}</div>
             <div className="exit-qr-plate">Plat terdaftar {activeSession.plate}</div>
+
+            {(() => {
+              const r = remaining(activeSession.exitCodeExpiry);
+              if (!r) return null;
+              if (r.sec === 0) {
+                return (
+                  <div className="expiry-line expired">
+                    QR keluar kedaluwarsa — kendaraan tidak dapat keluar.
+                    <div style={{ marginTop: 6 }}>
+                      <button type="button" className="link-action" onClick={handleReissueExit} disabled={loading}>
+                        Bayar denda Rp20.000 &amp; terbitkan QR keluar baru
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+              return <div className="expiry-line">QR keluar berlaku {r.text} (20 menit sejak pembayaran)</div>;
+            })()}
           </div>
 
           <div className="note-box">

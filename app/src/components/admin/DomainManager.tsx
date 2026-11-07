@@ -75,14 +75,7 @@ export function DomainManager({ domains, zones, onRefresh }: DomainManagerProps)
 
   return (
     <div className="admin-zone-manager">
-      <div className="section-header row" style={{ justifyContent: 'space-between' }}>
-        <div>
-          <h2>Domain parkir</h2>
-          <p className="hint-text" style={{ margin: 0 }}>
-            Kelompokkan zona berdasarkan domain area. Setiap zona terikat ke satu domain.
-          </p>
-        </div>
-        <button
+      <div className="page-toolbar">        <button
           type="button"
           className="btn btn-primary"
           onClick={() => (showForm && !editing ? setShowForm(false) : openAdd())}

@@ -33,12 +33,6 @@ export function VlmTestView() {
   return (
     <div className="vlm-test-container">
       <section className="card">
-        <h2>Uji Mandiri VLM Plat Nomor (OpenRouter AI)</h2>
-        <p>
-          Unggah foto kendaraan atau plat nomor Indonesia. Proxy lokal memanggil model Vision VLM OpenRouter
-          (API key tersimpan aman di server).
-        </p>
-
         <div className="row mb-3">
           <label>
             <small>Konteks: </small>

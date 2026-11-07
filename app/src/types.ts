@@ -69,6 +69,8 @@ export interface ParkingSession {
   exitCode?: string;
   exitCodeExpiry?: number;
   bill?: ParkingBill;
+  penaltyTotal?: number;
+  penalties?: Array<{ type: string; amount: number; paidAt: string }>;
   payment?: ParkingPayment;
   expiredReason?: string;
 }
@@ -129,15 +131,35 @@ export interface Analytics {
     zoneViolations: number;
     revenue: number;
     payments: number;
+    penaltyRevenue: number;
+    penalties: number;
     highPriorityZones: number;
   };
   zones: ZoneAnalytics[];
   domains: DomainAnalytics[];
   hours: Array<{ hour: string; activity: number }>;
   peakHours: Array<{ hour: string; activity: number }>;
+  period?: string;
+  gates: Array<{
+    gateId: string;
+    samples: number;
+    ewma: number;
+    lastScore: number;
+    lastAt: string | null;
+    lowSamples: number;
+    average: number;
+    recent: number[];
+    trend: number;
+    status: 'baik' | 'menurun' | 'perlu-perhatian';
+    lastSharpness: number;
+    lastBrightness: number;
+    lastContrast: number;
+  }>;
   finance: {
     totalRevenue: number;
     totalPayments: number;
+    penaltyRevenue: number;
+    grandTotal: number;
     byVehicle: { motorcycle: number; car: number };
     byZone: Array<{
       zoneId: string;

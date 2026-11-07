@@ -2,6 +2,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { consensusPlate } from './plateConsensus.mjs';
+import { checkToken, createRateLimiter, clientIp } from './auth.mjs';
 import {
   initMasterData,
   getZonesWithOccupancy,
@@ -11,6 +13,7 @@ import {
   processZoneScan,
   processPayment,
   processGateOut,
+  reissueExitCode,
   createDomain,
   updateDomain,
   deleteDomain,
@@ -19,7 +22,16 @@ import {
   deleteZone,
   getAllSessions,
   getAnalytics,
+  recordGateQuality,
+  getEventHistory,
   adminOverrideGate,
+  cancelBooking,
+  requestCheckout,
+  changeZone,
+  rebuildCounters,
+  startScheduler,
+  stopScheduler,
+  redis,
   redisSub,
   EVENT_CHANNEL,
 } from './store.mjs';
@@ -34,6 +46,30 @@ const OPENROUTER_BASE_URL = (process.env.OPENROUTER_BASE_URL || 'https://openrou
 const OPENROUTER_MODEL = process.env.OPENROUTER_VLM_MODEL || 'google/gemini-2.5-flash';
 const SITE_URL = process.env.OPENROUTER_SITE_URL || 'http://localhost:5173';
 const APP_NAME = process.env.OPENROUTER_APP_NAME || 'Smart Parking Kampus';
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || '';
+const GATE_API_TOKEN = process.env.GATE_API_TOKEN || '';
+
+// Structured logging (JSON lines)
+function log(level, msg, meta = {}) {
+  console.log(JSON.stringify({ level, msg, time: new Date().toISOString(), ...meta }));
+}
+
+// Lightweight in-process metrics
+const metrics = { requests: 0, errors: 0, rateLimited: 0, authDenied: 0, vlmCalls: 0 };
+
+const limitVlm = createRateLimiter({ windowMs: 60000, max: 30 });
+const limitWrite = createRateLimiter({ windowMs: 60000, max: 30 });
+const limitRead = createRateLimiter({ windowMs: 60000, max: 180 });
+
+function rateLimited(res, result) {
+  metrics.rateLimited += 1;
+  res.writeHead(429, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Retry-After': String(result.retryAfter || 1),
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.end(JSON.stringify({ ok: false, error: 'Terlalu banyak permintaan. Coba lagi nanti.' }));
+}
 
 function loadEnv(file) {
   try {
@@ -55,8 +91,8 @@ function json(res, status, body) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Token',
   });
   res.end(data);
 }
@@ -94,7 +130,9 @@ Balas HANYA JSON valid (tanpa markdown) dengan format:
 {"plate":"B 1234 ABC","confidence":0.0-1.0,"vehicle_type":"car|motorcycle|unknown","raw_text":"teks terbaca","notes":"catatan singkat jika ada"}
 Jika plat tidak terbaca, isi plate dengan null dan jelaskan di notes.`;
 
+  metrics.vlmCalls += 1;
   const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+    signal: AbortSignal.timeout(Number(process.env.VLM_TIMEOUT_MS || 20000)),
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
@@ -169,16 +207,86 @@ setInterval(() => {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  metrics.requests += 1;
+  res.on('finish', () => {
+    if (res.statusCode >= 500) metrics.errors += 1;
+  });
+
   if (req.method === 'OPTIONS') return json(res, 204, {});
 
-  // Health check
+  // Health check (verifies Redis too)
   if (req.method === 'GET' && url.pathname === '/health') {
+    let redisOk = false;
+    try {
+      redisOk = (await redis.ping()) === 'PONG';
+    } catch {
+      redisOk = false;
+    }
+    return json(res, redisOk ? 200 : 503, {
+      ok: redisOk,
+      redis: redisOk,
+      vlmConfigured: Boolean(OPENROUTER_API_KEY),
+      model: OPENROUTER_MODEL,
+      activeSseClients: sseClients.size,
+      uptimeSeconds: Math.round(process.uptime()),
+    });
+  }
+
+  // Prometheus-style metrics
+  if (req.method === 'GET' && url.pathname === '/metrics') {
+    const body = [
+      `smart_parking_requests_total ${metrics.requests}`,
+      `smart_parking_errors_total ${metrics.errors}`,
+      `smart_parking_rate_limited_total ${metrics.rateLimited}`,
+      `smart_parking_auth_denied_total ${metrics.authDenied}`,
+      `smart_parking_vlm_calls_total ${metrics.vlmCalls}`,
+      `smart_parking_sse_clients ${sseClients.size}`,
+    ].join('\n');
+    res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+    return res.end(`${body}\n`);
+  }
+
+  // Public auth capability info (no secrets): lets the UI decide to show a login page
+  if (req.method === 'GET' && url.pathname === '/api/auth/status') {
     return json(res, 200, {
       ok: true,
-      model: OPENROUTER_MODEL,
-      hasApiKey: Boolean(OPENROUTER_API_KEY),
-      activeSseClients: sseClients.size,
+      adminTokenRequired: Boolean(ADMIN_API_TOKEN),
+      gateTokenRequired: Boolean(GATE_API_TOKEN),
     });
+  }
+
+  // Rate limiting: VLM is the most expensive surface
+  const isVlmPath = url.pathname.startsWith('/api/vlm/');
+  const isWrite = ['POST', 'PUT', 'DELETE'].includes(req.method || '');
+  const limiter = isVlmPath ? limitVlm : isWrite ? limitWrite : limitRead;
+  const rateKey = req.headers['x-api-token'] || clientIp(req);
+  const rateResult = limiter(String(rateKey));
+  if (!rateResult.allowed) return rateLimited(res, rateResult);
+
+  // Authorization: admin console routes/mutations and gate/VLM routes
+  const isAdminRoute = url.pathname.startsWith('/api/admin/');
+  const domainMutation =
+    isWrite && (url.pathname === '/api/domains' || url.pathname.startsWith('/api/domains/'));
+  // /api/zones/scan belongs to the driver flow; only zone CRUD is admin-only.
+  const zoneMutation =
+    (req.method === 'POST' && url.pathname === '/api/zones') ||
+    (['PUT', 'DELETE'].includes(req.method || '') && /^\/api\/zones\/[^/]+$/.test(url.pathname));
+  const isAdminMutation = domainMutation || zoneMutation;
+
+  if (isAdminRoute || isAdminMutation) {
+    const denied = checkToken(req, ADMIN_API_TOKEN, 'admin');
+    if (denied) {
+      metrics.authDenied += 1;
+      return json(res, denied.status, { ok: false, error: denied.error });
+    }
+  }
+
+  if (url.pathname.startsWith('/api/gates/') || isVlmPath) {
+    const denied = checkToken(req, GATE_API_TOKEN, 'gate');
+    if (denied) {
+      metrics.authDenied += 1;
+      return json(res, denied.status, { ok: false, error: denied.error });
+    }
   }
 
   // SSE Live update stream
@@ -209,6 +317,37 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req));
       const result = await readPlate(body || {});
       return json(res, result.ok ? 200 : 400, result);
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Multi-frame plate OCR: read up to 5 frames, return a consensus decision
+  if (req.method === 'POST' && url.pathname === '/api/vlm/plate/consensus') {
+    try {
+      const body = JSON.parse(await readBody(req, 24 * 1024 * 1024));
+      const frames = Array.isArray(body?.frames) ? body.frames.slice(0, 5) : [];
+      if (frames.length === 0) {
+        return json(res, 400, { ok: false, error: 'frames wajib berisi minimal 1 gambar' });
+      }
+
+      const results = await Promise.all(
+        frames.map(async (frame) => {
+          const result = await readPlate({
+            imageBase64: frame.imageBase64,
+            mimeType: frame.mimeType || 'image/jpeg',
+            context: body.context || 'entry',
+          });
+          return {
+            plate: result.ok ? result.result?.plate || null : null,
+            confidence: result.ok ? result.result?.confidence : undefined,
+            error: result.ok ? undefined : result.error,
+          };
+        })
+      );
+
+      const decision = consensusPlate(results);
+      return json(res, 200, { ok: true, model: OPENROUTER_MODEL, ...decision, frames: results });
     } catch (err) {
       return json(res, 400, { ok: false, error: err?.message || String(err) });
     }
@@ -301,11 +440,40 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Gate kiosk: report local image-quality metrics (sharpness/brightness/contrast)
+  const qualityMatch = url.pathname.match(/^\/api\/gates\/([A-Za-z0-9_-]+)\/quality$/);
+  if (req.method === 'POST' && qualityMatch) {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const result = await recordGateQuality(qualityMatch[1], body || {});
+      return json(res, 200, { ok: true, ...result });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
   // Admin: Activity analytics & preventive-maintenance priorities
   if (req.method === 'GET' && url.pathname === '/api/admin/analytics') {
     try {
-      const analytics = await getAnalytics();
+      const date = url.searchParams.get('date') || undefined;
+      const from = url.searchParams.get('from') || undefined;
+      const to = url.searchParams.get('to') || undefined;
+      const analytics = await getAnalytics({ date, from, to });
       return json(res, 200, { ok: true, ...analytics });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Audit log history (date filter, default = latest events)
+  if (req.method === 'GET' && url.pathname === '/api/admin/events') {
+    try {
+      const date = url.searchParams.get('date') || undefined;
+      const from = url.searchParams.get('from') || undefined;
+      const to = url.searchParams.get('to') || undefined;
+      const limit = Math.min(Number(url.searchParams.get('limit')) || 200, 500);
+      const events = await getEventHistory({ date, from, to, limit });
+      return json(res, 200, { ok: true, events });
     } catch (err) {
       return json(res, 500, { ok: false, error: err?.message || String(err) });
     }
@@ -343,6 +511,39 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, session });
     } catch (err) {
       return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Driver: move the session to another zone (before entry, or once after entry)
+  if (req.method === 'POST' && url.pathname === '/api/bookings/change-zone') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const session = await changeZone(body || {});
+      return json(res, 200, { ok: true, session });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Driver: start checkout without scanning the zone QR again
+  if (req.method === 'POST' && url.pathname === '/api/payments/checkout') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const session = await requestCheckout(body || {});
+      return json(res, 200, { ok: true, session });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Driver: cancel a booking before entering the gate
+  if (req.method === 'POST' && url.pathname === '/api/bookings/cancel') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const session = await cancelBooking(body || {});
+      return json(res, 200, { ok: true, session });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
     }
   }
 
@@ -401,6 +602,17 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Re-issue expired exit QR (paid sessions only)
+  if (req.method === 'POST' && url.pathname === '/api/payments/reissue') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const result = await reissueExitCode(body || {});
+      return json(res, 200, { ok: true, ...result });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
   // Gate Out: Scan exit QR + VLM plate verification
   if (req.method === 'POST' && url.pathname === '/api/gates/exit') {
     try {
@@ -437,9 +649,32 @@ const server = http.createServer(async (req, res) => {
   return json(res, 404, { ok: false, error: 'Not found' });
 });
 
-// Initialize master data on startup
-initMasterData().catch(console.error);
+// Startup: master data, counter rebuild, expiry scheduler, config warnings
+initMasterData()
+  .then(async () => {
+    const rebuilt = await rebuildCounters();
+    log('info', 'counters_rebuilt', { keys: rebuilt });
+    startScheduler(30000);
+    if (!ADMIN_API_TOKEN) log('warn', 'admin_token_missing', { note: 'admin API is open' });
+    if (!GATE_API_TOKEN) log('warn', 'gate_token_missing', { note: 'gate/VLM API is open' });
+    if (!OPENROUTER_API_KEY) log('warn', 'openrouter_key_missing');
+  })
+  .catch((err) => log('error', 'startup_failed', { error: String(err) }));
 
 server.listen(PORT, HOST, () => {
-  console.log(`Smart Parking server listening on http://${HOST}:${PORT} (model=${OPENROUTER_MODEL}, Redis=connected)`);
+  log('info', 'server_listening', {
+    url: `http://${HOST}:${PORT}`,
+    model: OPENROUTER_MODEL,
+  });
 });
+
+function shutdown(signal) {
+  log('info', 'shutdown', { signal });
+  stopScheduler();
+  server.close(() => {
+    Promise.allSettled([redis.quit(), redisSub.quit()]).finally(() => process.exit(0));
+  });
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
