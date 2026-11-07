@@ -262,7 +262,7 @@ function ExploreView({
     return list;
   }, [zones, selectedPill, searchQuery]);
 
-  // Book Spot - NO PLATE INPUT (VLM reads at Gate In!) & NO ETD (only ETA, flat Rp2.000)
+  // Book Spot - NO PLATE INPUT (VLM reads at Gate In!) & NO ETD (tarif by vehicle & duration)
   const handleConfirmBooking = async () => {
     if (!bottomSheetZone) return;
     setLoading(true);
@@ -343,7 +343,7 @@ function ExploreView({
           <span className="vehicle-spots-tag">{motorSpots} Spots</span>
           <div className="vehicle-emoji">🏍️</div>
           <div className="vehicle-label">Two-Wheeler</div>
-          <div className="vehicle-price-sub">Rp2.000 / flat</div>
+          <div className="vehicle-price-sub">Rp1.000 / Rp2.000</div>
         </div>
 
         <div
@@ -353,7 +353,7 @@ function ExploreView({
           <span className="vehicle-spots-tag">{carSpots} Spots</span>
           <div className="vehicle-emoji">🚗</div>
           <div className="vehicle-label">Four-Wheeler</div>
-          <div className="vehicle-price-sub">Rp2.000 / flat</div>
+          <div className="vehicle-price-sub">Rp2.000 / Rp3.000</div>
         </div>
       </div>
 
@@ -388,7 +388,7 @@ function ExploreView({
 
                 <div className="plot-card-bottom">
                   <div className="plot-rate-num">
-                    Rp2.000 <small style={{ fontSize: 11, fontWeight: 500, color: 'var(--text-muted)' }}>/ 4 hrs</small>
+                    Mulai Rp1.000
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span className="plot-spots-badge">
@@ -437,8 +437,8 @@ function ExploreView({
                 <strong>{selectedVehicle === 'car' ? 'Four-Wheeler' : 'Two-Wheeler'}</strong>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0' }}>
-                <span style={{ color: 'var(--text-muted)' }}>Tarif Flat:</span>
-                <strong style={{ color: '#4f46e5' }}>Rp2.000 / 4 hrs</strong>
+                <span style={{ color: 'var(--text-muted)' }}>Tarif:</span>
+                <strong style={{ color: '#4f46e5' }}>Motor Rp1.000/&lt;1jam, Rp2.000 flat · Mobil Rp2.000/&lt;1jam, Rp3.000 flat</strong>
               </div>
             </div>
 

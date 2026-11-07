@@ -239,18 +239,32 @@ export async function processZoneScan({ sessionCode, scannedZoneId, action }) {
       throw new Error(`Status tidak valid untuk checkout: ${session.status}`);
     }
 
-    // Standard flat rate Rp2.000 (no ETD concept)
-    const baseFee = 2000;
-    const total = 2000;
+    // Tarif: motor <1 jam Rp1.000, flat Rp2.000; mobil <1 jam Rp2.000, flat Rp3.000
+    const nowMs = now.getTime();
+    const startMs = session.entryTime
+      ? new Date(session.entryTime).getTime()
+      : (session.parkedTime ? new Date(session.parkedTime).getTime() : new Date(session.createdAt).getTime());
+    const durationMin = Math.max(1, Math.round((nowMs - startMs) / 60000));
+    const isMotor = (session.vehicleType || 'motorcycle') === 'motorcycle';
+    let baseFee;
+    if (isMotor) {
+      baseFee = durationMin < 60 ? 1000 : 2000;
+    } else {
+      baseFee = durationMin < 60 ? 2000 : 3000;
+    }
 
     session.status = 'CHECKOUT_REQUESTED';
     session.checkoutTime = now.toISOString();
     session.bill = {
       baseFee,
       penaltyFee: 0,
-      total,
+      total: baseFee,
       isOverstay: false,
-      notes: 'Tarif parkir kampus normal',
+      durationMin,
+      vehicleType: session.vehicleType || 'motorcycle',
+      notes: isMotor
+        ? (durationMin < 60 ? 'Tarif motor <1 jam' : 'Tarif motor flat')
+        : (durationMin < 60 ? 'Tarif mobil <1 jam' : 'Tarif mobil flat'),
     };
 
     await saveSession(session);
