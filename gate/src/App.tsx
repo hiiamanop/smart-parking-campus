@@ -4,6 +4,8 @@ import { loadPlateDetector, getDetectorSession, detectPlate, cropPlate, type Pla
 
 type PipelineStep = '1_SCANNING_QR' | '2_READING_PLATE_VLM' | '3_SAVING_OPENING' | '4_GATE_OPENED';
 
+const API_BASE = typeof window !== 'undefined' && window.location.port === '5175' ? 'http://127.0.0.1:8788' : '';
+
 export function App() {
   const [gateMode, setGateMode] = useState<'entry' | 'exit'>('entry');
   const [currentStep, setCurrentStep] = useState<PipelineStep>('1_SCANNING_QR');
@@ -115,7 +117,7 @@ export function App() {
     const m = dataUrl.match(/^data:(.*?);base64,(.*)$/);
     const mimeType = m?.[1] || 'image/jpeg';
     const imageBase64 = m?.[2] || dataUrl;
-    const res = await fetch('/api/vlm/plate', {
+    const res = await fetch(`${API_BASE}/api/vlm/plate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ imageBase64, mimeType, context: gateMode }),
@@ -342,7 +344,7 @@ export function App() {
 
   // Live Redis Pub/Sub SSE (gate terminal)
   useEffect(() => {
-    const sse = new EventSource('/api/events');
+    const sse = new EventSource(`${API_BASE}/api/events`);
     sse.onopen = () => setRedisLive(true);
     sse.onerror = () => setRedisLive(false);
     sse.onmessage = (e) => {
@@ -399,7 +401,7 @@ export function App() {
 
     try {
       if (gateMode === 'entry') {
-        const res = await fetch('/api/gates/entry', {
+        const res = await fetch(`${API_BASE}/api/gates/entry`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -416,7 +418,7 @@ export function App() {
         setStatusText(`PLAT ${data.session.plate} TERSIMPAN! PALANG GATE MASUK TERBUKA.`);
       } else {
         // Exit Gate
-        const res = await fetch('/api/gates/exit', {
+        const res = await fetch(`${API_BASE}/api/gates/exit`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -458,7 +460,7 @@ export function App() {
       const mimeType = m?.[1] || 'image/jpeg';
       const imageBase64 = m?.[2] || snapshotBase64;
 
-      const res = await fetch('/api/vlm/plate', {
+      const res = await fetch(`${API_BASE}/api/vlm/plate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ imageBase64, mimeType, context: gateMode }),
@@ -603,7 +605,7 @@ export function App() {
       {/* Header */}
       <header className="kiosk-navbar">
         <div className="kiosk-headline">
-          <span>📹</span>
+          <img className="kiosk-logo" src="/logo-itb.png" alt="Logo ITB" />
           <span>Terminal Kiosk Gate &amp; AI Scanner</span>
         </div>
 
@@ -613,8 +615,8 @@ export function App() {
             <span>{cameraActive ? 'Kamera & VLM Aktif' : 'Kamera Nonaktif — Pakai Upload Foto'}</span>
           </div>
 
-          <div className={`kiosk-pill-live ${redisLive ? '' : 'offline'}`} style={{ background: redisLive ? '#0c1e3a' : '#1e293b', borderColor: redisLive ? '#3b82f6' : '#475569', color: redisLive ? '#93c5fd' : '#94a3b8' }}>
-            <span className={redisLive ? 'pulse-circle-green' : 'pulse-circle-red'} style={{ background: redisLive ? '#3b82f6' : '#64748b' }} />
+          <div className={`kiosk-pill-live ${redisLive ? '' : 'offline'}`}>
+            <span className={redisLive ? 'pulse-circle-green' : 'pulse-circle-red'} />
             <span>{redisLive ? 'Redis Live' : 'Redis Offline'}</span>
           </div>
 

@@ -1,20 +1,21 @@
 import { useState } from 'react';
-import type { Faculty, Zone } from '../../types';
+import type { Domain, Zone } from '../../types';
 import { createZoneApi, updateZoneApi, deleteZoneApi } from '../../lib/api';
 
 interface ZoneManagerProps {
-  faculties: Faculty[];
+  domains: Domain[];
   zones: Zone[];
   onRefresh: () => void;
 }
 
-export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
+export function ZoneManager({ domains, zones, onRefresh }: ZoneManagerProps) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [editingZone, setEditingZone] = useState<Zone | null>(null);
 
   // Form states
   const [name, setName] = useState('');
-  const [facultyId, setFacultyId] = useState(faculties[0]?.id || 'FT');
+  const [domainId, setDomainId] = useState(domains[0]?.id || '');
+  const [vehicleType, setVehicleType] = useState<'car' | 'motorcycle'>('motorcycle');
   const [capacity, setCapacity] = useState(20);
   const [gateIn, setGateIn] = useState('');
   const [gateOut, setGateOut] = useState('');
@@ -25,7 +26,8 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
 
   const handleOpenAdd = () => {
     setName('');
-    setFacultyId(faculties[0]?.id || 'FT');
+    setDomainId(domains[0]?.id || '');
+    setVehicleType('motorcycle');
     setCapacity(20);
     setGateIn('');
     setGateOut('');
@@ -38,7 +40,8 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
   const handleOpenEdit = (z: Zone) => {
     setEditingZone(z);
     setName(z.name);
-    setFacultyId(z.facultyId);
+    setDomainId(z.domainId);
+    setVehicleType(z.vehicleType || 'motorcycle');
     setCapacity(z.capacity);
     setGateIn(z.gateIn);
     setGateOut(z.gateOut);
@@ -57,7 +60,8 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
       if (editingZone) {
         await updateZoneApi(editingZone.id, {
           name,
-          facultyId,
+          domainId,
+          vehicleType,
           capacity,
           gateIn,
           gateOut,
@@ -66,7 +70,8 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
       } else {
         await createZoneApi({
           name,
-          facultyId,
+          domainId,
+          vehicleType,
           capacity,
           gateIn,
           gateOut,
@@ -141,14 +146,14 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
               </div>
               <div className="form-group">
                 <label>
-                  Fakultas Terkait:
+                  Domain:
                   <select
-                    value={facultyId}
-                    onChange={(e) => setFacultyId(e.target.value)}
+                    value={domainId}
+                    onChange={(e) => setDomainId(e.target.value)}
                   >
-                    {faculties.map((f) => (
-                      <option key={f.id} value={f.id}>
-                        {f.name} ({f.id})
+                    {domains.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.name} ({d.id})
                       </option>
                     ))}
                   </select>
@@ -157,6 +162,19 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
             </div>
 
             <div className="form-row">
+              <div className="form-group">
+                <label>
+                  Jenis Kendaraan:
+                  <select
+                    value={vehicleType}
+                    onChange={(e) => setVehicleType(e.target.value as 'car' | 'motorcycle')}
+                    required
+                  >
+                    <option value="motorcycle">Motor</option>
+                    <option value="car">Mobil</option>
+                  </select>
+                </label>
+              </div>
               <div className="form-group">
                 <label>
                   Total Kapasitas Slot:
@@ -221,7 +239,8 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
               <tr>
                 <th>ID Zona</th>
                 <th>Nama Zona</th>
-                <th>Fakultas</th>
+                <th>Domain</th>
+                <th>Kendaraan</th>
                 <th>Kapasitas</th>
                 <th>Terisi</th>
                 <th>Sisa Slot</th>
@@ -231,13 +250,14 @@ export function ZoneManager({ faculties, zones, onRefresh }: ZoneManagerProps) {
             </thead>
             <tbody>
               {zones.map((z) => {
-                const fac = faculties.find((f) => f.id === z.facultyId);
+                const dom = domains.find((d) => d.id === z.domainId);
                 const percent = Math.round((z.occupied / z.capacity) * 100);
                 return (
                   <tr key={z.id}>
                     <td><code>{z.id}</code></td>
                     <td><strong>{z.name}</strong></td>
-                    <td>{fac?.name || z.facultyId}</td>
+                    <td>{dom?.name || z.domainId}</td>
+                    <td>{z.vehicleType === 'car' ? 'Mobil' : 'Motor'}</td>
                     <td>{z.capacity} slot</td>
                     <td>{z.occupied} ({percent}%)</td>
                     <td>

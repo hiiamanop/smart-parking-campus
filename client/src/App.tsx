@@ -1,16 +1,17 @@
 import { useEffect, useState, useMemo } from 'react';
 import QRCode from 'qrcode';
 
-interface Faculty {
+interface Domain {
   id: string;
   name: string;
-  defaultZoneId: string;
+  description?: string;
 }
 
 interface Zone {
   id: string;
   name: string;
-  facultyId: string;
+  domainId: string;
+  vehicleType?: 'car' | 'motorcycle';
   capacity: number;
   occupied: number;
   available: number;
@@ -22,7 +23,7 @@ interface Zone {
 interface ParkingSession {
   id: string;
   sessionCode: string;
-  facultyId: string;
+  domainId: string;
   zoneId: string;
   userName: string;
   vehicleType: 'car' | 'motorcycle';
@@ -43,15 +44,18 @@ interface ParkingSession {
   };
 }
 
+const API_BASE = typeof window !== 'undefined' && window.location.port === '5174' ? 'http://127.0.0.1:8788' : '';
+
+const formatRupiah = (value: number) => `Rp${value.toLocaleString('id-ID')}`;
+
 export function App() {
   const [activeTab, setActiveTab] = useState<'parking' | 'timeline'>('parking');
-  const [faculties, setFaculties] = useState<Faculty[]>([]);
+  const [domains, setDomains] = useState<Domain[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
   const [redisLive, setRedisLive] = useState(false);
   const [exitNotice, setExitNotice] = useState<string | null>(null);
   const [now, setNow] = useState<Date>(new Date());
 
-  // Active Parking Session in localStorage
   const [activeSession, setActiveSession] = useState<ParkingSession | null>(() => {
     try {
       const saved = localStorage.getItem('smart_parking_driver_real_session');
@@ -69,35 +73,40 @@ export function App() {
     } catch {}
   };
 
-  // Live clock for header
   useEffect(() => {
     const iv = setInterval(() => setNow(new Date()), 30000);
     return () => clearInterval(iv);
   }, []);
 
-  // Load Zones Master Data
   useEffect(() => {
-    fetch('/api/zones')
-      .then((r) => r.json())
+    fetch(`${API_BASE}/api/zones`)
+      .then(async (r) => {
+        const contentType = r.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) return null;
+        return r.json();
+      })
       .then((data) => {
-        if (data.ok) {
-          setFaculties(data.faculties);
-          setZones(data.zones);
+        if (data && data.ok && Array.isArray(data.zones)) {
+          setDomains(data.domains || []);
+          setZones(data.zones || []);
         }
       })
-      .catch(() => {});
+      .catch((err) => console.warn('Gagal memuat /api/zones:', err));
   }, []);
 
-  // Rehydrate & validate stored session on load (anonymous: session lives in localStorage)
   useEffect(() => {
     const code = activeSession?.sessionCode;
     if (!code) return;
     let cancelled = false;
     const validate = () => {
-      fetch(`/api/sessions/${code}`)
-        .then((r) => r.json())
+      fetch(`${API_BASE}/api/sessions/${code}`)
+        .then(async (r) => {
+          const contentType = r.headers.get('content-type') || '';
+          if (!contentType.includes('application/json')) return null;
+          return r.json();
+        })
         .then((res) => {
-          if (cancelled) return;
+          if (cancelled || !res) return;
           if (!res.ok || !res.session) {
             updateSession(null);
             return;
@@ -111,15 +120,19 @@ export function App() {
         .catch(() => {});
     };
     validate();
-    const onVis = () => { if (document.visibilityState === 'visible') validate(); };
+    const onVis = () => {
+      if (document.visibilityState === 'visible') validate();
+    };
     document.addEventListener('visibilitychange', onVis);
-    return () => { cancelled = true; document.removeEventListener('visibilitychange', onVis); };
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVis);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Live Redis Pub/Sub SSE
   useEffect(() => {
-    const sse = new EventSource('/api/events');
+    const sse = new EventSource(`${API_BASE}/api/events`);
     sse.onopen = () => setRedisLive(true);
     sse.onerror = () => setRedisLive(false);
 
@@ -128,22 +141,27 @@ export function App() {
         const event = JSON.parse(e.data);
         if (event.type === 'ZONE_SNAPSHOT' || event.type === 'ZONE_UPDATED') {
           if (event.payload?.zones) setZones(event.payload.zones);
-          if (event.payload?.faculties) setFaculties(event.payload.faculties);
+          if (event.payload?.domains) setDomains(event.payload.domains);
         }
 
-        // Live sync active session whenever gate or zone action occurs
         if (activeSession && (event.payload?.sessionCode === activeSession.sessionCode || event.type === 'GATE_EXIT_SUCCESS')) {
           if (event.type === 'GATE_EXIT_SUCCESS' && event.payload?.sessionCode === activeSession.sessionCode) {
-            setExitNotice('Kendaraan berhasil keluar. Palang gate terbuka, tiket dihapus.');
-            setTimeout(() => { updateSession(null); setExitNotice(null); }, 2500);
+            setExitNotice('Kendaraan tercatat keluar. Tiket ditutup.');
+            setTimeout(() => {
+              updateSession(null);
+              setExitNotice(null);
+            }, 2500);
           } else {
-            fetch(`/api/sessions/${activeSession.sessionCode}`)
+            fetch(`${API_BASE}/api/sessions/${activeSession.sessionCode}`)
               .then((r) => r.json())
               .then((res) => {
                 if (res.ok && res.session) {
                   if (res.session.status === 'COMPLETED') {
-                    setExitNotice('Kendaraan berhasil keluar. Palang gate terbuka, tiket dihapus.');
-                    setTimeout(() => { updateSession(null); setExitNotice(null); }, 2500);
+                    setExitNotice('Kendaraan tercatat keluar. Tiket ditutup.');
+                    setTimeout(() => {
+                      updateSession(null);
+                      setExitNotice(null);
+                    }, 2500);
                   } else {
                     updateSession(res.session);
                   }
@@ -159,34 +177,31 @@ export function App() {
 
   return (
     <div className="mobile-app">
-      {/* Top Profile Header (Matches Image #1) */}
       <header className="mobile-header">
-        <div className="profile-group">
-          <div className="profile-date-text" id="live-clock">
-            {now.toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-            {' · '}
-            {now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
+        <div className="brand-block">
+          <img className="brand-logo" src="/logo-itb.png" alt="Logo ITB" />
+          <div>
+            <div className="brand-name">Parkir Kampus</div>
+            <div className="brand-date">
+              {now.toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long' })}
+              {' · '}
+              {now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
+            </div>
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div className="bell-icon-btn">
-            <span>🔔</span>
-            <span className="bell-alert-dot" />
-          </div>
+        <div className={`live-pill ${redisLive ? 'on' : ''}`}>
+          <span className="live-dot" />
+          {redisLive ? 'Tersinkron' : 'Luring'}
         </div>
       </header>
 
-      {exitNotice && (
-        <div className="exit-notice-toast">
-          ✅ {exitNotice}
-        </div>
-      )}
-      {/* Main Mobile Content Area */}
+      {exitNotice && <div className="toast-notice">{exitNotice}</div>}
+
       <div className="mobile-content">
         {activeTab === 'parking' ? (
           <ExploreView
-            faculties={faculties}
+            domains={domains}
             zones={zones}
             onBookSuccess={(sess) => {
               updateSession(sess);
@@ -196,7 +211,7 @@ export function App() {
         ) : (
           <TimelineTicketView
             zones={zones}
-            faculties={faculties}
+            domains={domains}
             activeSession={activeSession}
             onUpdateSession={updateSession}
             onGoToExplore={() => setActiveTab('parking')}
@@ -204,24 +219,21 @@ export function App() {
         )}
       </div>
 
-      {/* Fixed Bottom Dock: Exactly 2 Tabs (Matches Image #1 & #3) */}
       <nav className="mobile-bottom-nav">
         <button
           type="button"
           className={`bottom-tab-item ${activeTab === 'parking' ? 'active' : ''}`}
           onClick={() => setActiveTab('parking')}
         >
-          <span className="bottom-tab-icon">🚗</span>
-          <span>Parking</span>
+          Cari parkir
         </button>
-
         <button
           type="button"
           className={`bottom-tab-item ${activeTab === 'timeline' ? 'active' : ''}`}
           onClick={() => setActiveTab('timeline')}
         >
-          <span className="bottom-tab-icon">⏱️</span>
-          <span>{activeSession ? 'Timeline ●' : 'Timeline'}</span>
+          Tiket saya
+          {activeSession && <span className="tab-dot" />}
         </button>
       </nav>
     </div>
@@ -229,14 +241,14 @@ export function App() {
 }
 
 // =========================================================================
-// TAB 1: PARKING (EXPLORE & SLOTS) - Matches Image #1 & Image #2
+// TAB 1 — Cari & pesan slot
 // =========================================================================
 function ExploreView({
-  faculties,
+  domains,
   zones,
   onBookSuccess,
 }: {
-  faculties: Faculty[];
+  domains: Domain[];
   zones: Zone[];
   onBookSuccess: (sess: ParkingSession) => void;
 }) {
@@ -249,32 +261,44 @@ function ExploreView({
   const [err, setErr] = useState<string | null>(null);
 
   const totalAvailable = useMemo(() => zones.reduce((a, b) => a + b.available, 0), [zones]);
-  const motorSpots = Math.round(totalAvailable * 0.65);
-  const carSpots = totalAvailable - motorSpots;
+  const totalCapacity = useMemo(() => zones.reduce((a, b) => a + b.capacity, 0), [zones]);
+  const isMotorZone = (z: Zone) => (z.vehicleType || 'motorcycle') === 'motorcycle';
+  const motorSpots = useMemo(
+    () => zones.filter(isMotorZone).reduce((a, z) => a + z.available, 0),
+    [zones]
+  );
+  const carSpots = useMemo(
+    () => zones.filter((z) => !isMotorZone(z)).reduce((a, z) => a + z.available, 0),
+    [zones]
+  );
 
   const filteredZones = useMemo(() => {
-    let list = zones;
-    if (selectedPill !== 'all') list = list.filter((z) => z.facultyId === selectedPill);
+    // Zone list follows the selected vehicle type
+    let list = zones.filter((z) =>
+      selectedVehicle === 'motorcycle' ? (z.vehicleType || 'motorcycle') === 'motorcycle' : z.vehicleType === 'car'
+    );
+    if (selectedPill !== 'all') list = list.filter((z) => z.domainId === selectedPill);
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      list = list.filter((z) => z.name.toLowerCase().includes(q) || z.facultyId.toLowerCase().includes(q));
+      list = list.filter(
+        (z) => z.name.toLowerCase().includes(q) || z.domainId.toLowerCase().includes(q)
+      );
     }
     return list;
-  }, [zones, selectedPill, searchQuery]);
+  }, [zones, selectedPill, searchQuery, selectedVehicle]);
 
-  // Book Spot - NO PLATE INPUT (VLM reads at Gate In!) & NO ETD (tarif by vehicle & duration)
   const handleConfirmBooking = async () => {
     if (!bottomSheetZone) return;
     setLoading(true);
     setErr(null);
     try {
-      const res = await fetch('/api/bookings', {
+      const res = await fetch(`${API_BASE}/api/bookings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          facultyId: bottomSheetZone.facultyId,
+          domainId: bottomSheetZone.domainId,
           zoneId: bottomSheetZone.id,
-          userName: 'Pearl Plaha',
+          userName: 'Pengguna Kampus',
           vehicleType: selectedVehicle,
           eta: etaTime,
         }),
@@ -293,184 +317,178 @@ function ExploreView({
 
   return (
     <div>
-      <h1 className="headline-title">Reserve a parking space</h1>
+      <section className="summary-panel">
+        <div className="summary-main">
+          <span className="summary-number">{totalAvailable}</span>
+          <span className="summary-unit">slot tersedia</span>
+        </div>
+        <div className="summary-meta">
+          {totalCapacity} kapasitas · {zones.length} zona
+        </div>
+      </section>
 
-      {/* Search Bar */}
-      <div className="search-bar-mobile">
-        <span className="search-icon-svg">🔍</span>
+      <h1 className="headline-title">Pesan tempat parkir</h1>
+      <p className="page-sub">Pilih area, kendaraan, dan perkiraan waktu tiba.</p>
+
+      <div className="search-bar">
         <input
-          className="search-field-input"
+          className="search-field"
           type="text"
-          placeholder="Tell us where you want to go"
+          placeholder="Cari zona atau fakultas"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
         />
-        <span style={{ fontSize: 16, color: 'var(--text-muted)' }}>🎙️</span>
       </div>
 
-      {/* Horizontal Category Pills */}
-      <div className="category-pills-scroll">
+      <div className="filter-scroll">
         <button
           type="button"
-          className={`category-pill ${selectedPill === 'all' ? 'active' : ''}`}
+          className={`filter-chip ${selectedPill === 'all' ? 'active' : ''}`}
           onClick={() => setSelectedPill('all')}
         >
-          <span>⭐</span>
-          <span>Semua ({zones.length})</span>
+          Semua area
         </button>
-        {faculties.map((f) => (
+        {domains.map((f) => (
           <button
             key={f.id}
             type="button"
-            className={`category-pill ${selectedPill === f.id ? 'active' : ''}`}
+            className={`filter-chip ${selectedPill === f.id ? 'active' : ''}`}
             onClick={() => setSelectedPill(f.id)}
           >
-            <span>🏛️</span>
-            <span>{f.name}</span>
+            {f.name}
           </button>
         ))}
       </div>
 
-      {/* Vehicle Selector: Only Two-Wheeler & Four-Wheeler (NO three-wheeler) */}
-      <h3 className="sub-headline">What are you driving today?</h3>
-      <p className="sub-caption">Helping you find best routes and parking areas</p>
+      <div className="section-head">
+        <h2 className="section-title">Jenis kendaraan</h2>
+      </div>
 
-      <div className="vehicles-horizontal-row">
-        <div
-          className={`vehicle-box ${selectedVehicle === 'motorcycle' ? 'selected' : ''}`}
+      <div className="vehicle-row">
+        <button
+          type="button"
+          className={`vehicle-card ${selectedVehicle === 'motorcycle' ? 'selected' : ''}`}
           onClick={() => setSelectedVehicle('motorcycle')}
         >
-          <span className="vehicle-spots-tag">{motorSpots} Spots</span>
-          <div className="vehicle-emoji">🏍️</div>
-          <div className="vehicle-label">Two-Wheeler</div>
-          <div className="vehicle-price-sub">Rp1.000 / Rp2.000</div>
-        </div>
+          <span className="vehicle-label">Motor</span>
+          <span className="vehicle-spots">{motorSpots} slot</span>
+          <span className="vehicle-price">Rp1.000 / Rp2.000</span>
+        </button>
 
-        <div
-          className={`vehicle-box ${selectedVehicle === 'car' ? 'selected' : ''}`}
+        <button
+          type="button"
+          className={`vehicle-card ${selectedVehicle === 'car' ? 'selected' : ''}`}
           onClick={() => setSelectedVehicle('car')}
         >
-          <span className="vehicle-spots-tag">{carSpots} Spots</span>
-          <div className="vehicle-emoji">🚗</div>
-          <div className="vehicle-label">Four-Wheeler</div>
-          <div className="vehicle-price-sub">Rp2.000 / Rp3.000</div>
+          <span className="vehicle-label">Mobil</span>
+          <span className="vehicle-spots">{carSpots} slot</span>
+          <span className="vehicle-price">Rp2.000 / Rp3.000</span>
+        </button>
+      </div>
+
+      <div className="section-head">
+        <h2 className="section-title">Zona parkir</h2>
+        <span className="section-count">{filteredZones.length} area</span>
+      </div>
+
+      {filteredZones.length === 0 ? (
+        <div className="empty-state">
+          <strong>{zones.length === 0 ? 'Menghubungkan ke server' : 'Tidak ada zona yang cocok'}</strong>
+          <p>
+            {zones.length === 0
+              ? 'Data ketersediaan slot sedang dimuat.'
+              : 'Ubah kata kunci pencarian atau filter fakultas.'}
+          </p>
         </div>
-      </div>
-
-      {/* Showing parking plots near you */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 18, marginBottom: 8 }}>
-        <h3 className="sub-headline" style={{ margin: 0 }}>Showing parking plots near you</h3>
-        <span style={{ fontSize: 12, color: '#4f46e5', fontWeight: 700 }}>View all</span>
-      </div>
-
-      <div>
-        {filteredZones.map((z) => {
-          const fac = faculties.find((f) => f.id === z.facultyId);
-          return (
-            <div key={z.id} className="plot-mobile-card">
-              <div className="plot-image-header">
-                <img
-                  className="plot-img"
-                  src="https://images.unsplash.com/photo-1506521781263-d8422e82f27a?w=500&auto=format&fit=crop&q=80"
-                  alt={z.name}
-                />
-                <span className="rating-pill-float">⭐ 4.2 (50+)</span>
-              </div>
-
-              <div className="plot-card-content">
-                <h4 className="plot-card-name">{z.name}</h4>
-                <div className="plot-card-sub">Plot: {z.gateIn} • Dekat {fac?.name || z.facultyId}</div>
-                <div className="plot-card-meta">
-                  <span>⏱️ 10 mins</span>
-                  <span>📍 1.2 km away</span>
-                  <span>🔒 VLM Gate Guard</span>
-                </div>
-
-                <div className="plot-card-bottom">
-                  <div className="plot-rate-num">
-                    Mulai Rp1.000
+      ) : (
+        <div className="zone-list-scroll">
+          {filteredZones.map((z) => {
+            const fac = domains.find((f) => f.id === z.domainId);
+            const ratio = z.capacity > 0 ? Math.round((z.occupied / z.capacity) * 100) : 0;
+            return (
+              <article key={z.id} className="zone-item">
+                <div className="zone-item-top">
+                  <div>
+                    <h3 className="zone-item-name">{z.name}</h3>
+                    <div className="zone-item-sub">
+                      {fac?.name || z.domainId} · {z.vehicleType === 'car' ? 'Mobil' : 'Motor'}
+                    </div>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span className="plot-spots-badge">
-                      {z.isFull ? 'Penuh' : `${z.available} spots left`}
-                    </span>
-                    <button
-                      type="button"
-                      className="book-spot-btn"
-                      disabled={z.isFull}
-                      onClick={() => setBottomSheetZone(z)}
-                    >
-                      Book Spot
-                    </button>
+                  <div className={`zone-count ${z.isFull ? 'full' : ''}`}>
+                    <span className="zone-count-number">{z.isFull ? '0' : z.available}</span>
+                    <span className="zone-count-label">{z.isFull ? 'penuh' : 'tersedia'}</span>
                   </div>
                 </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
 
-      {/* Bottom Sheet Booking Confirmation (Matches Image #2 Screen 3) */}
+                <div className="meter">
+                  <div className={`meter-fill ${z.isFull ? 'full' : ''}`} style={{ width: `${ratio}%` }} />
+                </div>
+
+                <div className="zone-item-bottom">
+                  <span className="zone-item-meta">
+                    {z.occupied}/{z.capacity} terisi · {z.gateIn}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-primary-sm"
+                    disabled={z.isFull}
+                    onClick={() => setBottomSheetZone(z)}
+                  >
+                    {z.isFull ? 'Penuh' : 'Pesan slot'}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+
       {bottomSheetZone && (
-        <div className="bottom-sheet-backdrop" onClick={() => setBottomSheetZone(null)}>
-          <div className="bottom-sheet-card" onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-              <h3 style={{ fontSize: 18, fontWeight: 800 }}>Select your vehicle</h3>
-              <button
-                type="button"
-                onClick={() => setBottomSheetZone(null)}
-                style={{ background: '#f1f5f9', border: 'none', borderRadius: '50%', width: 30, height: 30, cursor: 'pointer' }}
-              >
-                ✕
+        <div className="sheet-backdrop" onClick={() => setBottomSheetZone(null)}>
+          <div className="sheet-card" onClick={(e) => e.stopPropagation()}>
+            <div className="sheet-head">
+              <h3>Konfirmasi pesanan</h3>
+              <button type="button" className="icon-close" onClick={() => setBottomSheetZone(null)}>
+                Tutup
               </button>
             </div>
 
             {err && <div className="alert-message err">{err}</div>}
 
-            <div style={{ background: '#f8fafc', padding: 12, borderRadius: 12, marginBottom: 14, fontSize: 13 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0' }}>
-                <span style={{ color: 'var(--text-muted)' }}>Lokasi Zona:</span>
-                <strong>{bottomSheetZone.name}</strong>
+            <dl className="detail-list">
+              <div className="detail-row">
+                <dt>Zona</dt>
+                <dd>{bottomSheetZone.name}</dd>
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0' }}>
-                <span style={{ color: 'var(--text-muted)' }}>Kendaraan:</span>
-                <strong>{selectedVehicle === 'car' ? 'Four-Wheeler' : 'Two-Wheeler'}</strong>
+              <div className="detail-row">
+                <dt>Kendaraan</dt>
+                <dd>{selectedVehicle === 'car' ? 'Mobil' : 'Motor'}</dd>
               </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0' }}>
-                <span style={{ color: 'var(--text-muted)' }}>Tarif:</span>
-                <strong style={{ color: '#4f46e5' }}>Motor Rp1.000/&lt;1jam, Rp2.000 flat · Mobil Rp2.000/&lt;1jam, Rp3.000 flat</strong>
+              <div className="detail-row">
+                <dt>Tarif</dt>
+                <dd>
+                  {selectedVehicle === 'car'
+                    ? 'Rp2.000 (<1 jam) · Rp3.000 (>1 jam)'
+                    : 'Rp1.000 (<1 jam) · Rp2.000 (>1 jam)'}
+                </dd>
               </div>
-            </div>
+            </dl>
 
-            <div style={{ marginBottom: 16 }}>
-              <label style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>
-                ESTIMASI TIBA (ETA):
-              </label>
+            <label className="field-label">
+              Perkiraan waktu tiba
               <input
                 type="time"
                 value={etaTime}
                 onChange={(e) => setEtaTime(e.target.value)}
-                style={{
-                  width: '100%',
-                  padding: 10,
-                  borderRadius: 10,
-                  border: '1.5px solid var(--border-strong)',
-                  fontSize: 15,
-                  fontWeight: 700,
-                }}
+                className="time-input"
               />
-              <small style={{ color: 'var(--text-muted)', fontSize: 11, display: 'block', marginTop: 4 }}>
-                *Tidak perlu ketik plat nomor. Kamera AI VLM di gate masuk akan otomatis membaca plat kendaraan Anda.
-              </small>
-            </div>
+            </label>
+            <p className="field-hint">
+              Plat nomor tidak perlu diisi. Kamera gate membaca plat otomatis saat kendaraan tiba.
+            </p>
 
-            <button
-              type="button"
-              className="btn-cta-purple"
-              disabled={loading}
-              onClick={handleConfirmBooking}
-            >
-              {loading ? 'Menerbitkan Tiket...' : 'Book Spot'}
+            <button type="button" className="btn-primary-block" disabled={loading} onClick={handleConfirmBooking}>
+              {loading ? 'Menerbitkan tiket…' : 'Konfirmasi & terbitkan tiket'}
             </button>
           </div>
         </div>
@@ -480,17 +498,17 @@ function ExploreView({
 }
 
 // =========================================================================
-// TAB 2: TIMELINE (TICKET & CURRENT PARKING) - Matches Image #3
+// TAB 2 — Tiket & sesi parkir
 // =========================================================================
 function TimelineTicketView({
   zones,
-  faculties,
+  domains,
   activeSession,
   onUpdateSession,
   onGoToExplore,
 }: {
   zones: Zone[];
-  faculties: Faculty[];
+  domains: Domain[];
   activeSession: ParkingSession | null;
   onUpdateSession: (sess: ParkingSession | null) => void;
   onGoToExplore: () => void;
@@ -498,19 +516,18 @@ function TimelineTicketView({
   const [qrUrl, setQrUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
-
-  // Live Timer for elapsed duration
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [zoneQr, setZoneQr] = useState('');
 
-  // Generate QR for Session / Exit
   useEffect(() => {
     const code = activeSession?.exitCode || activeSession?.sessionCode;
     if (code) {
-      QRCode.toDataURL(code, { width: 170, margin: 2 }).then(setQrUrl);
+      QRCode.toDataURL(code, { width: 170, margin: 2 })
+        .then(setQrUrl)
+        .catch((err) => console.warn('QR gen error:', err));
     }
   }, [activeSession?.sessionCode, activeSession?.exitCode]);
 
-  // Live Elapsed Timer
   useEffect(() => {
     if (activeSession?.entryTime && activeSession.status !== 'COMPLETED') {
       const startMs = new Date(activeSession.entryTime).getTime();
@@ -529,19 +546,33 @@ function TimelineTicketView({
   const secs = String(elapsedSec % 60).padStart(2, '0');
 
   const currentZone = zones.find((z) => z.id === activeSession?.zoneId);
+  const currentDomain = domains.find(
+    (d) => d.id === (activeSession?.domainId || currentZone?.domainId)
+  );
 
-  // In-Zone Action (Confirm or Checkout)
+  // Accepts a physical zone QR payload ("CAMPUS-ZONE-<zoneId>") or a raw zone id
+  const parseZoneQr = (raw: string) => {
+    const value = raw.trim();
+    const match = value.match(/CAMPUS-ZONE-(.+)$/i);
+    return match ? match[1].trim() : value;
+  };
+
   const handleZoneAction = async (action: 'confirm_park' | 'checkout') => {
     if (!activeSession) return;
+    const scannedZoneId = parseZoneQr(zoneQr);
+    if (!scannedZoneId) {
+      setStatusMsg({ ok: false, text: 'Pindai atau masukkan kode QR zona terlebih dahulu.' });
+      return;
+    }
     setLoading(true);
     setStatusMsg(null);
     try {
-      const res = await fetch('/api/zones/scan', {
+      const res = await fetch(`${API_BASE}/api/zones/scan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionCode: activeSession.sessionCode,
-          scannedZoneId: activeSession.zoneId,
+          scannedZoneId,
           action,
         }),
       });
@@ -555,12 +586,11 @@ function TimelineTicketView({
     }
   };
 
-  // Pay QRIS
   const handlePay = async () => {
     if (!activeSession) return;
     setLoading(true);
     try {
-      const res = await fetch('/api/payments/pay', {
+      const res = await fetch(`${API_BASE}/api/payments/pay`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionCode: activeSession.sessionCode, paymentMethod: 'QRIS' }),
@@ -577,96 +607,89 @@ function TimelineTicketView({
 
   if (!activeSession) {
     return (
-      <div style={{ textAlign: 'center', padding: '60px 10px' }}>
-        <div style={{ fontSize: 60, marginBottom: 14 }}>🎟️</div>
-        <h3 style={{ fontSize: 18, fontWeight: 800, marginBottom: 6 }}>Belum Ada Tiket Parkir</h3>
-        <p style={{ color: 'var(--text-muted)', fontSize: 13, marginBottom: 20 }}>
-          Pesan tempat parkir terlebih dahulu untuk mendapatkan tiket QR digital Anda.
-        </p>
-        <button type="button" className="btn-cta-purple" onClick={onGoToExplore}>
-          Cari &amp; Pesan Slot Parkir
+      <div className="empty-state tall">
+        <strong>Belum ada tiket aktif</strong>
+        <p>Pesan slot terlebih dahulu untuk mendapatkan tiket QR parkir.</p>
+        <button type="button" className="btn-primary-block" onClick={onGoToExplore}>
+          Cari slot parkir
         </button>
       </div>
     );
   }
 
-  // ==========================================================
-  // VIEW 1: PARKING TICKET (Matches Image #3 Screen 2) - BOOKED
-  // ==========================================================
   if (activeSession.status === 'BOOKED') {
     return (
       <div>
-        <div className="ticket-page-nav">
-          <button type="button" className="circle-btn-nav" onClick={onGoToExplore}>←</button>
-          <span className="ticket-page-title">Parking Ticket</span>
-          <button type="button" className="circle-btn-nav" onClick={() => onUpdateSession(null)}>✕</button>
+        <div className="page-nav">
+          <button type="button" className="icon-nav" onClick={onGoToExplore}>
+            Kembali
+          </button>
+          <span className="page-nav-title">Tiket parkir</span>
+          <button type="button" className="icon-nav" onClick={() => onUpdateSession(null)}>
+            Batalkan
+          </button>
         </div>
 
         {statusMsg && (
-          <div className={`alert-message ${statusMsg.ok ? 'ok' : 'err'}`}>
-            {statusMsg.text}
-          </div>
+          <div className={`alert-message ${statusMsg.ok ? 'ok' : 'err'}`}>{statusMsg.text}</div>
         )}
 
-        {/* Notched Ticket Card */}
-        <div className="ticket-box-notched">
-          <div className="ticket-upper-part">
-            <div className="ticket-circle-badge">🎟️</div>
-            <h2 className="ticket-h2">Your parking is booked!</h2>
-            <p className="ticket-sub-lead">
-              Tunjukkan QR Code ini ke scanner di palang gate masuk kampus.
+        <div className="ticket">
+          <div className="ticket-top">
+            <div className="ticket-badge">Belum masuk</div>
+            <h2 className="ticket-title">Tiket parkir terbit</h2>
+            <p className="ticket-lead">
+              Tunjukkan QR ini ke pemindai di palang masuk. Palang terbuka setelah plat nomor terbaca.
             </p>
 
-            <div className="ticket-plot-strip">
-              <div className="ticket-strip-thumb">🅿️</div>
+            <div className="ticket-meta">
               <div>
-                <strong style={{ fontSize: 14, color: 'var(--text-main)' }}>
-                  {currentZone?.name || activeSession.zoneId}
-                </strong>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                  Wednesday Oct 29 | ETA: {activeSession.eta}
-                </div>
+                <span className="ticket-meta-label">Zona</span>
+                <span className="ticket-meta-value">{currentZone?.name || activeSession.zoneId}</span>
+              </div>
+              <div>
+                <span className="ticket-meta-label">Domain</span>
+                <span className="ticket-meta-value">{currentDomain?.name || activeSession.domainId}</span>
+              </div>
+              <div>
+                <span className="ticket-meta-label">ETA</span>
+                <span className="ticket-meta-value">{activeSession.eta}</span>
               </div>
             </div>
           </div>
 
-          {/* Semicircular Cutout Notches */}
-          <div className="ticket-notch-row">
-            <div className="notch-half notch-l" />
-            <div className="notch-dashed" />
-            <div className="notch-half notch-r" />
+          <div className="ticket-divider">
+            <span className="notch left" />
+            <span className="dash" />
+            <span className="notch right" />
           </div>
 
-          {/* Lower QR Code */}
-          <div className="ticket-lower-part">
-            <div className="ticket-qr-plate">
-              {qrUrl && <img src={qrUrl} alt="QR Sesi" width={170} height={170} />}
+          <div className="ticket-bottom">
+            <div className="qr-frame">
+              {qrUrl && <img src={qrUrl} alt="QR tiket" width={170} height={170} />}
             </div>
-            <div className="ticket-num-tag">PARKING TICKET NUMBER</div>
-            <div className="ticket-num-code">#{activeSession.sessionCode}</div>
+            <div className="ticket-code-label">Nomor tiket</div>
+            <div className="ticket-code">#{activeSession.sessionCode}</div>
           </div>
         </div>
 
-        <div style={{ background: '#f8fafc', border: '1px solid var(--border-strong)', borderRadius: 14, padding: 14, marginTop: 16, textAlign: 'center' }}>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5, margin: 0 }}>
-            📸 <strong>Instruksi Gate Masuk:</strong> Tunjukkan QR ini ke scanner gate masuk. Kamera AI VLM gate akan otomatis membaca plat kendaraan Anda dan membuka palang pintu masuk.
-          </p>
+        <div className="note-box">
+          <strong>Di gate masuk.</strong> Tempelkan QR ke pemindai. Kamera membaca plat kendaraan, lalu palang terbuka otomatis.
         </div>
       </div>
     );
   }
 
-  // ==========================================================
-  // VIEW 2: CURRENT PARKING (Matches Image #3 Screen 3)
-  // ==========================================================
   return (
     <div>
-      <div className="ticket-page-nav">
-        <button type="button" className="circle-btn-nav" onClick={onGoToExplore}>←</button>
-        <span className="ticket-page-title">Current Parking</span>
+      <div className="page-nav">
+        <button type="button" className="icon-nav" onClick={onGoToExplore}>
+          Kembali
+        </button>
+        <span className="page-nav-title">Sesi berjalan</span>
         <button
           type="button"
-          className="circle-btn-nav"
+          className="icon-nav"
           onClick={() => {
             if (confirm('Batalkan sesi ini?')) {
               onUpdateSession(null);
@@ -674,112 +697,109 @@ function TimelineTicketView({
             }
           }}
         >
-          ✕
+          Batalkan
         </button>
       </div>
 
       {statusMsg && (
-        <div className={`alert-message ${statusMsg.ok ? 'ok' : 'err'}`}>
-          {statusMsg.text}
-        </div>
+        <div className={`alert-message ${statusMsg.ok ? 'ok' : 'err'}`}>{statusMsg.text}</div>
       )}
 
-      {/* Circular Progress Timer Ring */}
-      <div className="current-timer-center">
-        <div className="circular-timer-box">
-          <div className="timer-text-digits">
-            {hrs} : {mins} : {secs}
-          </div>
-          <div className="timer-labels-row">
-            <span>hr</span>
-            <span>min</span>
-            <span>sec</span>
-          </div>
+      <section className="timer-panel">
+        <div className="timer-caption">Durasi parkir</div>
+        <div className="timer-digits">
+          {hrs}:{mins}:{secs}
         </div>
-      </div>
-
-      {/* Info List */}
-      <div className="current-info-card">
-        <div className="current-row">
-          <span className="current-row-label">📍 Parked:</span>
-          <span className="current-row-val">{currentZone?.name || activeSession.zoneId}</span>
+        <div className="timer-units">
+          <span>jam</span>
+          <span>menit</span>
+          <span>detik</span>
         </div>
+      </section>
 
-        <div className="current-row">
-          <span className="current-row-label">🚗 Car Number:</span>
-          <span className="plate-vlm-box">{activeSession.plate || 'Membaca VLM...'}</span>
+      <dl className="detail-list">
+        <div className="detail-row">
+          <dt>Zona</dt>
+          <dd>{currentZone?.name || activeSession.zoneId}</dd>
         </div>
-
-        <div className="current-row">
-          <span className="current-row-label">⏱️ Parked At:</span>
-          <span className="current-row-val">
-            {activeSession.entryTime ? new Date(activeSession.entryTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : activeSession.eta}
-          </span>
+        <div className="detail-row">
+          <dt>Plat nomor</dt>
+          <dd>
+            <span className="plate-chip">{activeSession.plate || 'Belum terbaca'}</span>
+          </dd>
         </div>
-
-        <div className="current-row">
-          <span className="current-row-label">💳 Transaction Status:</span>
-          <span className="current-row-val" style={{ color: activeSession.status === 'PAID' ? '#10b981' : '#f59e0b' }}>
-            {activeSession.status === 'PAID' ? `Paid (Rp${(activeSession.bill?.total ?? 2000).toLocaleString('id-ID')})` : `Unpaid (Rp${(activeSession.bill?.total ?? 2000).toLocaleString('id-ID')})`}
-          </span>
+        <div className="detail-row">
+          <dt>Waktu masuk</dt>
+          <dd>
+            {activeSession.entryTime
+              ? new Date(activeSession.entryTime).toLocaleTimeString('id-ID', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })
+              : activeSession.eta}
+          </dd>
         </div>
-      </div>
+        <div className="detail-row">
+          <dt>Pembayaran</dt>
+          <dd className={activeSession.status === 'PAID' ? 'text-ok' : 'text-warn'}>
+            {activeSession.status === 'PAID'
+              ? `Lunas · ${formatRupiah(activeSession.bill?.total ?? 2000)}`
+              : `Belum dibayar · ${formatRupiah(activeSession.bill?.total ?? 2000)}`}
+          </dd>
+        </div>
+      </dl>
 
-      {/* Contextual Action Buttons */}
+      {(activeSession.status === 'ENTERED' || activeSession.status === 'PARKED_CONFIRMED') && (
+        <label className="field-label">
+          Kode QR zona yang dipindai
+          <input
+            className="time-input"
+            type="text"
+            placeholder="CAMPUS-ZONE-…"
+            value={zoneQr}
+            onChange={(e) => setZoneQr(e.target.value)}
+          />
+        </label>
+      )}
+
       {activeSession.status === 'ENTERED' && (
         <div>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', marginBottom: 10 }}>
-            Kendaraan telah melewati gate masuk. Konfirmasi saat tiba di zona Anda:
+          <p className="action-hint">
+            Tempelkan QR tiang zona ke kamera. Sesi ini hanya sah di zona tujuan Anda.
           </p>
-          <button
-            type="button"
-            className="btn-cta-purple"
-            disabled={loading}
-            onClick={() => handleZoneAction('confirm_park')}
-          >
-            {loading ? 'Memproses...' : '📍 Konfirmasi Tiba di Tiang Zona'}
+          <button type="button" className="btn-primary-block" disabled={loading} onClick={() => handleZoneAction('confirm_park')}>
+            {loading ? 'Memproses…' : 'Konfirmasi tiba di zona'}
           </button>
         </div>
       )}
 
       {activeSession.status === 'PARKED_CONFIRMED' && (
-        <button
-          type="button"
-          className="btn-cta-purple"
-          disabled={loading}
-          onClick={() => handleZoneAction('checkout')}
-        >
-          {loading ? 'Memproses...' : 'Check Out (Selesai Parkir)'}
+        <button type="button" className="btn-primary-block" disabled={loading} onClick={() => handleZoneAction('checkout')}>
+          {loading ? 'Memproses…' : 'Selesai parkir'}
         </button>
       )}
 
       {activeSession.status === 'CHECKOUT_REQUESTED' && (
-        <button
-          type="button"
-          className="btn-cta-purple"
-          disabled={loading}
-          onClick={handlePay}
-        >
-          {loading ? 'Memproses...' : `Bayar Sekarang (QRIS Rp${(activeSession.bill?.total ?? 2000).toLocaleString('id-ID')})`}
+        <button type="button" className="btn-primary-block" disabled={loading} onClick={handlePay}>
+          {loading
+            ? 'Memproses…'
+            : `Bayar ${formatRupiah(activeSession.bill?.total ?? 2000)} via QRIS`}
         </button>
       )}
 
       {activeSession.status === 'PAID' && (
         <div>
-          <div style={{ textAlign: 'center', marginBottom: 14 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-muted)' }}>
-              QR KELUAR RESMI (LUNAS)
+          <div className="exit-qr">
+            <div className="qr-frame">
+              {qrUrl && <img src={qrUrl} alt="QR keluar" width={150} height={150} />}
             </div>
-            <div style={{ margin: '8px auto', display: 'inline-block' }}>
-              {qrUrl && <img src={qrUrl} alt="QR Keluar" width={150} height={150} style={{ borderRadius: 12 }} />}
-            </div>
-            <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
-              Plat Terdaftar: <strong>{activeSession.plate}</strong>
-            </div>
+            <div className="ticket-code-label">QR keluar</div>
+            <div className="ticket-code small">{activeSession.exitCode}</div>
+            <div className="exit-qr-plate">Plat terdaftar {activeSession.plate}</div>
           </div>
 
-          <div style={{ background: '#ecfdf5', border: '1px solid #a7f3d0', borderRadius: 12, padding: 12, textAlign: 'center', fontSize: 12, color: '#065f46', lineHeight: 1.4 }}>
-            📸 <strong>Instruksi Gate Keluar:</strong> Arahkan kendaraan ke gate keluar kampus dan tunjukkan QR ini ke scanner gate. Kamera AI gate keluar akan memverifikasi plat nomor kendaraan Anda dan membuka palang.
+          <div className="note-box">
+            <strong>Di gate keluar.</strong> Tempelkan QR ini ke pemindai. Kamera memverifikasi plat sebelum palang terbuka.
           </div>
         </div>
       )}

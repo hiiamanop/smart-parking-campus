@@ -1,102 +1,57 @@
-import type { Faculty, Zone, ParkingSession, LiveEvent } from '../types';
+import type { Domain, Zone, ParkingSession, LiveEvent, Analytics } from '../types';
 
-export async function fetchZones(): Promise<{ faculties: Faculty[]; zones: Zone[] }> {
+export async function fetchZones(): Promise<{ domains: Domain[]; zones: Zone[] }> {
   const res = await fetch('/api/zones');
   const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Failed to fetch zones');
-  return { faculties: data.faculties, zones: data.zones };
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal memuat data zona');
+  return { domains: data.domains || [], zones: data.zones || [] };
 }
 
-export async function createBooking(payload: {
-  facultyId: string;
-  zoneId: string;
-  userName: string;
-  vehicleType: 'car' | 'motorcycle';
-  eta: string;
-  etd: string;
-}): Promise<ParkingSession> {
-  const res = await fetch('/api/bookings', {
+/* ------------------------------ Domains ------------------------------ */
+
+export async function createDomainApi(payload: {
+  name: string;
+  description?: string;
+}): Promise<Domain> {
+  const res = await fetch('/api/domains', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Booking failed');
-  return data.session;
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal membuat domain');
+  return data.domain;
 }
 
-export async function fetchSession(sessionCode: string): Promise<ParkingSession> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionCode)}`);
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Session not found');
-  return data.session;
-}
-
-export async function gateInEntry(payload: {
-  sessionCode: string;
-  platePhotoBase64?: string;
-  mimeType?: string;
-  manualPlateOverride?: string;
-}): Promise<{ session: ParkingSession; gateOpened: boolean }> {
-  const res = await fetch('/api/gates/entry', {
-    method: 'POST',
+export async function updateDomainApi(
+  id: string,
+  payload: { name?: string; description?: string }
+): Promise<Domain> {
+  const res = await fetch(`/api/domains/${encodeURIComponent(id)}`, {
+    method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Entry gate failed');
-  return { session: data.session, gateOpened: data.gateOpened };
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal mengubah domain');
+  return data.domain;
 }
 
-export async function zoneScan(payload: {
-  sessionCode: string;
-  scannedZoneId: string;
-  action: 'confirm_park' | 'checkout';
-}): Promise<ParkingSession> {
-  const res = await fetch('/api/zones/scan', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+export async function deleteDomainApi(id: string): Promise<Domain> {
+  const res = await fetch(`/api/domains/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
   });
   const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Zone scan failed');
-  return data.session;
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal menghapus domain');
+  return data.domain;
 }
 
-export async function payBill(payload: {
-  sessionCode: string;
-  paymentMethod?: string;
-}): Promise<ParkingSession> {
-  const res = await fetch('/api/payments/pay', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Payment failed');
-  return data.session;
-}
+/* ------------------------------- Zones ------------------------------- */
 
-export async function gateOutExit(payload: {
-  exitCode: string;
-  platePhotoBase64?: string;
-  mimeType?: string;
-  manualPlateOverride?: string;
-}): Promise<{ session: ParkingSession; gateOpened: boolean }> {
-  const res = await fetch('/api/gates/exit', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Exit gate failed');
-  return { session: data.session, gateOpened: data.gateOpened };
-}
-
-// Admin API calls
 export async function createZoneApi(payload: {
   name: string;
-  facultyId: string;
+  domainId: string;
+  vehicleType: 'car' | 'motorcycle';
   capacity: number;
   gateIn?: string;
   gateOut?: string;
@@ -115,7 +70,8 @@ export async function updateZoneApi(
   id: string,
   payload: {
     name?: string;
-    facultyId?: string;
+    domainId?: string;
+    vehicleType?: 'car' | 'motorcycle';
     capacity?: number;
     gateIn?: string;
     gateOut?: string;
@@ -140,6 +96,8 @@ export async function deleteZoneApi(id: string): Promise<Zone> {
   return data.zone;
 }
 
+/* ------------------------------- Admin ------------------------------- */
+
 export async function fetchAdminSessions(): Promise<ParkingSession[]> {
   const res = await fetch('/api/admin/sessions');
   const data = await res.json();
@@ -147,23 +105,15 @@ export async function fetchAdminSessions(): Promise<ParkingSession[]> {
   return data.sessions;
 }
 
-export async function emergencyGateOverride(payload: {
-  gateType: string;
-  zoneId?: string;
-  action?: string;
-  reason?: string;
-}): Promise<any> {
-  const res = await fetch('/api/admin/override', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+export async function fetchAnalytics(): Promise<Analytics> {
+  const res = await fetch('/api/admin/analytics');
   const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal override gate');
-  return data;
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal memuat analitik');
+  return data as Analytics;
 }
 
-// Subscribe to real-time events via Server-Sent Events (Redis Pub/Sub bridge)
+/* --------------------------- Live (SSE) ------------------------------ */
+
 export function subscribeToLiveEvents(
   onEvent: (event: LiveEvent) => void,
   onStatusChange?: (connected: boolean) => void
@@ -176,10 +126,9 @@ export function subscribeToLiveEvents(
 
   source.onmessage = (e) => {
     try {
-      const data = JSON.parse(e.data);
-      onEvent(data);
+      onEvent(JSON.parse(e.data));
     } catch {
-      // Ignore ping or non-json keepalive comments
+      // keepalive / non-JSON comments
     }
   };
 
