@@ -1,106 +1,173 @@
-import { useMemo, useState } from 'react';
-import { fileToDataUrl, readPlateFromDataUrl, type VlmPlateResponse } from './lib/vlm';
+import { useEffect, useState, useCallback } from 'react';
+import type { Faculty, Zone, LiveEvent } from './types';
+import { fetchZones, subscribeToLiveEvents } from './lib/api';
+import { ZoneManager } from './components/admin/ZoneManager';
+import { ZoneQRGenerator } from './components/admin/ZoneQRGenerator';
+import { SessionMonitor } from './components/admin/SessionMonitor';
+import { GateControl } from './components/admin/GateControl';
+import { LiveEventLog } from './components/admin/LiveEventLog';
+import { VlmTestView } from './components/VlmTestView';
 
-type BeforeInstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: string }> };
+type AdminTab = 'zones' | 'qr-signs' | 'sessions' | 'gates' | 'logs' | 'vlm';
 
 export function App() {
-  const [installEvt, setInstallEvt] = useState<BeforeInstallPromptEvent | null>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<string>('');
-  const [context, setContext] = useState<'entry' | 'exit'>('entry');
-  const [loading, setLoading] = useState(false);
-  const [resp, setResp] = useState<VlmPlateResponse | null>(null);
+  const [activeTab, setActiveTab] = useState<AdminTab>('zones');
+  const [faculties, setFaculties] = useState<Faculty[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
+  const [redisConnected, setRedisConnected] = useState<boolean>(false);
+  const [eventLogs, setEventLogs] = useState<LiveEvent[]>([]);
+  const [latestEventTimestamp, setLatestEventTimestamp] = useState<string>('');
 
-  useMemo(() => {
-    const onPrompt = (e: Event) => { e.preventDefault(); setInstallEvt(e as BeforeInstallPromptEvent); };
-    window.addEventListener('beforeinstallprompt', onPrompt);
-    return () => window.removeEventListener('beforeinstallprompt', onPrompt);
+  const loadData = useCallback(() => {
+    fetchZones()
+      .then((data) => {
+        setFaculties(data.faculties);
+        setZones(data.zones);
+      })
+      .catch((err) => console.error('Failed to load zones', err));
   }, []);
 
-  async function install() {
-    if (!installEvt) return;
-    await installEvt.prompt();
-    await installEvt.userChoice.catch(() => null);
-    setInstallEvt(null);
-  }
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
-  async function onPick(f: File | null) {
-    setFile(f); setResp(null);
-    setPreview(f ? await fileToDataUrl(f) : '');
-  }
+  // Hook up Redis Pub/Sub Live Events via SSE
+  useEffect(() => {
+    const unsubscribe = subscribeToLiveEvents(
+      (event: LiveEvent) => {
+        setEventLogs((prev) => [event, ...prev.slice(0, 99)]);
+        setLatestEventTimestamp(event.timestamp || new Date().toISOString());
 
-  async function run() {
-    if (!file) return;
-    setLoading(true); setResp(null);
-    try {
-      const dataUrl = preview || await fileToDataUrl(file);
-      setResp(await readPlateFromDataUrl(dataUrl, context));
-    } catch (e) {
-      setResp({ ok: false, error: e instanceof Error ? e.message : String(e) });
-    } finally { setLoading(false); }
-  }
+        if (event.type === 'ZONE_SNAPSHOT' && event.payload) {
+          if (event.payload.faculties) setFaculties(event.payload.faculties);
+          if (event.payload.zones) setZones(event.payload.zones);
+        } else if (event.type === 'ZONE_UPDATED' && event.payload) {
+          if (event.payload.zones) setZones(event.payload.zones);
+        }
+      },
+      (connected: boolean) => {
+        setRedisConnected(connected);
+      }
+    );
 
-  const r = resp?.result;
+    return () => {
+      unsubscribe();
+    };
+  }, []);
+
   return (
     <main>
-      <header>
+      <header className="no-print">
         <div>
-          <h1>Smart Parking Kampus</h1>
-          <small>Web-based (PWA) — MVP fondasi + tes VLM (OpenRouter)</small>
+          <div className="row" style={{ gap: 8, marginBottom: 4 }}>
+            <h1>Dashboard Admin — Smart Parking Kampus</h1>
+            <span className="badge" style={{ background: '#0f172a', color: '#fff' }}>Port 5173</span>
+          </div>
+          <p className="hint-text" style={{ margin: 0 }}>
+            Pusat Kendali Master Data Zona, Generate QR Tiang, Monitoring Kendaraan &amp; Audit Log Redis
+          </p>
         </div>
         <div className="row">
-          <span className="badge">PWA / Shortcut</span>
-          {installEvt ? <button className="secondary" onClick={install}>Tambah shortcut</button> : <small>Shortcut: menu browser “Add to Home Screen”</small>}
+          <span className={`badge badge-redis ${redisConnected ? 'connected' : ''}`}>
+            {redisConnected ? '● Redis Pub/Sub Live' : '○ Redis Reconnecting...'}
+          </span>
+          <a
+            href="http://localhost:5174"
+            target="_blank"
+            rel="noreferrer"
+            className="btn secondary btn-sm"
+            style={{ textDecoration: 'none' }}
+          >
+            🚗 Buka App Driver / Check-in &rarr;
+          </a>
         </div>
       </header>
 
-      <div className="grid">
-        <section className="card">
-          <h2>Alur MVP (ringkas)</h2>
-          <ol className="flow">
-            <li>Booking dari rumah (fakultas, zona, ETA/ETD) → QR/barcode sesi.</li>
-            <li>Gate masuk: scan QR sesi + <strong>VLM baca plat</strong> → sesi terkunci ke plat, palang terbuka.</li>
-            <li>Zona: scan QR zona (konfirmasi parkir).</li>
-            <li>Zona: scan QR zona (mulai checkout) → bill.</li>
-            <li>Bayar di app (QRIS, bukan di gate). Rp2.000 / overstay: violation + Rp2.000+Rp1.000.</li>
-            <li>Gate keluar: <strong>VLM verifikasi plat</strong> + QR/barcode keluar → palang terbuka.</li>
-          </ol>
-          <p><small>Dokumen lengkap: <code>docs/user-story.md</code>, <code>docs/backlog.md</code>, <code>docs/brd.md</code>.</small></p>
-        </section>
+      {/* Live Redis Ticker */}
+      {eventLogs[0] && (
+        <div className="live-ticker no-print">
+          <span className="live-ticker-dot" />
+          <span className="live-ticker-text">
+            [Redis Live] {eventLogs[0].type}: {JSON.stringify(eventLogs[0].payload).slice(0, 90)}...
+          </span>
+        </div>
+      )}
 
-        <section className="card">
-          <h2>Tes VLM Plat Nomor (OpenRouter)</h2>
-          <p>Upload foto kendaraan/plat. Proxy lokal memanggil OpenRouter dengan model dari <code>.env</code> (API key tidak dikirim ke browser).</p>
-          <div className="row" style={{ marginBottom: 8 }}>
-            <label><small>Konteks: </small>
-              <select value={context} onChange={(e) => setContext(e.target.value as 'entry'|'exit')}>
-                <option value="entry">Gate masuk (kunci sesi)</option>
-                <option value="exit">Gate keluar (verifikasi)</option>
-              </select>
-            </label>
-          </div>
-          <div className="row" style={{ marginBottom: 8 }}>
-            <input type="file" accept="image/*" onChange={(e) => onPick(e.target.files?.[0] || null)} />
-            <button onClick={run} disabled={!file || loading}>{loading ? 'Memproses...' : 'Baca plat (VLM)'}</button>
-          </div>
-          {preview && <img className="preview" src={preview} alt="Preview" />}
-          {resp && (
-            <div style={{ marginTop: 10 }}>
-              <p className={resp.ok ? 'ok' : 'err'}><strong>{resp.ok ? 'OK' : 'Gagal'}</strong>{resp.model ? ` — model: ${resp.model}` : ''}{resp.error ? `: ${resp.error}` : ''}</p>
-              {r && (
-                <dl className="kv">
-                  <dt>Plat</dt><dd>{r.plate ?? '(tidak terbaca)'}</dd>
-                  <dt>Confidence</dt><dd>{typeof r.confidence === 'number' ? r.confidence : '-'}</dd>
-                  <dt>Jenis</dt><dd>{r.vehicle_type || '-'}</dd>
-                  <dt>Catatan</dt><dd>{r.notes || '-'}</dd>
-                </dl>
-              )}
-              <details style={{ marginTop: 8 }}><summary>Respons mentah</summary><pre>{JSON.stringify(resp, null, 2)}</pre></details>
-            </div>
-          )}
-          <p style={{ marginTop: 10 }}><small>Jalankan proxy: <code>cd server && node --env-file=../.env server.mjs</code> (Node 20+) atau <code>node server.mjs</code> (loader .env bawaan). Isi <code>OPENROUTER_API_KEY</code> di <code>.env</code>.</small></p>
-        </section>
-      </div>
+      {/* Admin Tab Navigation */}
+      <nav className="nav-tabs no-print">
+        <button
+          className={`tab-btn ${activeTab === 'zones' ? 'active' : ''}`}
+          onClick={() => setActiveTab('zones')}
+        >
+          🏢 Master Zona (CRUD)
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'qr-signs' ? 'active' : ''}`}
+          onClick={() => setActiveTab('qr-signs')}
+        >
+          🖨️ Cetak QR Tiang Zona
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'sessions' ? 'active' : ''}`}
+          onClick={() => setActiveTab('sessions')}
+        >
+          🚗 Monitoring Sesi &amp; Kendaraan ({zones.reduce((acc, z) => acc + z.occupied, 0)})
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'gates' ? 'active' : ''}`}
+          onClick={() => setActiveTab('gates')}
+        >
+          🚨 Override Palang Gate
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'logs' ? 'active' : ''}`}
+          onClick={() => setActiveTab('logs')}
+        >
+          📡 Audit Log Redis ({eventLogs.length})
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'vlm' ? 'active' : ''}`}
+          onClick={() => setActiveTab('vlm')}
+        >
+          👁️ Uji AI Plat (VLM)
+        </button>
+      </nav>
+
+      {/* Admin Panels */}
+      {activeTab === 'zones' && (
+        <ZoneManager
+          faculties={faculties}
+          zones={zones}
+          onRefresh={loadData}
+        />
+      )}
+
+      {activeTab === 'qr-signs' && (
+        <ZoneQRGenerator
+          faculties={faculties}
+          zones={zones}
+        />
+      )}
+
+      {activeTab === 'sessions' && (
+        <SessionMonitor
+          zones={zones}
+          lastUpdateTimestamp={latestEventTimestamp}
+        />
+      )}
+
+      {activeTab === 'gates' && (
+        <GateControl zones={zones} />
+      )}
+
+      {activeTab === 'logs' && (
+        <LiveEventLog
+          events={eventLogs}
+          onClear={() => setEventLogs([])}
+        />
+      )}
+
+      {activeTab === 'vlm' && <VlmTestView />}
     </main>
   );
 }

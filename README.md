@@ -12,48 +12,53 @@ MVP berfokus pada **booking online** berbasis zona dengan alur QR di gate/zona, 
 ## Struktur
 ```text
 smart-parking/
-├── .env                 # konfigurasi lokal (ISI API key; jangan commit)
+├── .env                 # konfigurasi lokal (API key & Redis)
 ├── .env.example         # template env
-├── .gitignore
-├── README.md
-├── docs/
-│   ├── user-story.md
-│   ├── backlog.md
-│   └── brd.md
-├── server/              # proxy lokal OpenRouter VLM (API key tetap di server)
-│   ├── package.json
-│   └── server.mjs
-└── app/                 # web app (Vite + React + TS, PWA)
-    ├── public/          # manifest, icon, service worker
-    └── src/
-        └── lib/vlm.ts   # client ke proxy /api/vlm/plate
+├── server/              # Backend API + Redis Pub/Sub + SSE + OpenRouter VLM (Port 8788)
+│   ├── store.mjs        # state machine parkir, Redis cache & channel
+│   ├── server.mjs       # REST API & SSE bridge
+│   └── test-store.mjs   # automated tests
+├── app/                 # Dashboard Admin (Port 5173)
+│   ├── src/components/admin/ZoneManager.tsx     # CRUD zona parkir
+│   ├── src/components/admin/ZoneQRGenerator.tsx  # cetak QR tiang zona
+│   ├── src/components/admin/SessionMonitor.tsx   # monitoring sesi & kendaraan
+│   ├── src/components/admin/GateControl.tsx      # override palang gate
+│   └── src/components/admin/LiveEventLog.tsx    # audit log real-time Redis
+├── client/              # Driver Mobile App (Port 5174)
+│   └── src/App.tsx      # reservasi spot, tiket QR masuk, circular timer, bayar QRIS, tiket keluar
+└── gate/                # Gate Kiosk & Scanner Terminal (Port 5175)
+    └── src/App.tsx      # scan QR masuk -> AI VLM baca plat -> plat tersimpan -> buka gate
 ```
 
 ## Setup cepat
-1. Isi API key OpenRouter:
+1. Pastikan **Redis** menyala (via Docker/OrbStack):
    ```bash
-   # edit file .env
-   OPENROUTER_API_KEY=isi_key_openrouter_anda
-   OPENROUTER_VLM_MODEL=google/gemini-2.5-flash
+   docker run -d --name redis-parking -p 6379:6379 redis:alpine
    ```
-   Template lengkap: `.env.example`. **Jangan commit `.env`.**
 
-2. Jalankan proxy VLM (terminal 1):
+2. Jalankan Backend Server (terminal 1, port 8788):
    ```bash
-   cd smart-parking/server
-   node server.mjs
+   cd server && npm start
    # cek: http://127.0.0.1:8788/health
    ```
 
-3. Jalankan web app (terminal 2):
+3. Jalankan Dashboard Admin (terminal 2, port 5173):
    ```bash
-   cd smart-parking/app
-   npm install
-   npm run dev
+   cd app && npm run dev
    # buka: http://localhost:5173
    ```
 
-4. Uji VLM: di web app, upload foto plat/kendaraan → “Baca plat (VLM)”. Proxy meneruskan gambar ke OpenRouter (model dari `.env`) dan mengembalikan JSON (`plate`, `confidence`, dll.).
+4. Jalankan Driver Mobile App (terminal 3, port 5174):
+   ```bash
+   cd client && npm run dev
+   # buka: http://localhost:5174
+   ```
+
+5. Jalankan Gate Kiosk & AI Scanner (terminal 4, port 5175):
+   ```bash
+   cd gate && npm run dev
+   # buka: http://localhost:5175
+   ```
 
 ## Model VLM (OpenRouter)
 Default dipilih untuk MVP gate/plat: **`google/gemini-2.5-flash`** — keseimbangan akurasi vision/OCR, latensi, dan biaya; mudah diganti.
