@@ -81,6 +81,35 @@ export function App() {
       .catch(() => {});
   }, []);
 
+  // Rehydrate & validate stored session on load (anonymous: session lives in localStorage)
+  useEffect(() => {
+    const code = activeSession?.sessionCode;
+    if (!code) return;
+    let cancelled = false;
+    const validate = () => {
+      fetch(`/api/sessions/${code}`)
+        .then((r) => r.json())
+        .then((res) => {
+          if (cancelled) return;
+          if (!res.ok || !res.session) {
+            updateSession(null);
+            return;
+          }
+          if (res.session.status === 'COMPLETED' || res.session.status === 'EXPIRED') {
+            updateSession(null);
+          } else {
+            updateSession(res.session);
+          }
+        })
+        .catch(() => {});
+    };
+    validate();
+    const onVis = () => { if (document.visibilityState === 'visible') validate(); };
+    document.addEventListener('visibilitychange', onVis);
+    return () => { cancelled = true; document.removeEventListener('visibilitychange', onVis); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Live Redis Pub/Sub SSE
   useEffect(() => {
     const sse = new EventSource('/api/events');
@@ -132,7 +161,7 @@ export function App() {
             alt="Profile Avatar"
           />
           <div>
-            <div className="profile-name-text">Pearl Plaha</div>
+            <div className="profile-name-text">Pengemudi (Anonim)</div>
             <div className="profile-date-text">Oct 29, Wednesday</div>
           </div>
         </div>
