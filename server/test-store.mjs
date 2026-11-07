@@ -16,19 +16,22 @@ async function runSelfCheck() {
 
   // 1. Initialize master data
   await initMasterData();
-  const { faculties, zones } = await getZonesWithOccupancy();
-  assert.ok(faculties.length >= 4, 'Should have at least 4 faculties');
-  assert.ok(zones.length >= 4, 'Should have at least 4 zones');
-  const zoneA = zones.find((z) => z.id === 'zone-a');
-  assert.ok(zoneA, 'Zone A should exist');
-  const initialAvailable = zoneA.available;
+  const { domains, zones } = await getZonesWithOccupancy();
+  assert.ok(domains.length >= 1, 'Should have at least 1 domain');
+  assert.ok(zones.length >= 1, 'Should have at least 1 zone');
+
+  // Pick any zone that still has room, so the test is independent of seeded IDs
+  const zone = zones.find((z) => !z.isFull && (z.vehicleType || 'motorcycle') === 'motorcycle');
+  assert.ok(zone, 'At least one zone with available capacity should exist');
+  const zoneId = zone.id;
+  const initialAvailable = zone.available;
 
   // 2. Create booking
   const booking = await createBooking({
-    facultyId: 'FT',
-    zoneId: 'zone-a',
+    domainId: zone.domainId,
+    zoneId,
     userName: 'Budi Test',
-    vehicleType: 'car',
+    vehicleType: 'motorcycle',
     eta: '09:00',
     etd: '16:00',
   });
@@ -37,7 +40,7 @@ async function runSelfCheck() {
 
   // Quota should decrement
   const { zones: zonesAfterBooking } = await getZonesWithOccupancy();
-  const zoneAfter = zonesAfterBooking.find((z) => z.id === 'zone-a');
+  const zoneAfter = zonesAfterBooking.find((z) => z.id === zoneId);
   assert.equal(zoneAfter.available, initialAvailable - 1, 'Zone available quota should decrease by 1');
 
   // 3. Gate In with VLM plate detection
@@ -52,7 +55,7 @@ async function runSelfCheck() {
   // 4. Scan zone QR to confirm parking
   const parked = await processZoneScan({
     sessionCode: booking.sessionCode,
-    scannedZoneId: 'zone-a',
+    scannedZoneId: zoneId,
     action: 'confirm_park',
   });
   assert.equal(parked.status, 'PARKED_CONFIRMED');
@@ -60,12 +63,12 @@ async function runSelfCheck() {
   // 5. Scan zone QR to checkout
   const checkout = await processZoneScan({
     sessionCode: booking.sessionCode,
-    scannedZoneId: 'zone-a',
+    scannedZoneId: zoneId,
     action: 'checkout',
   });
   assert.equal(checkout.status, 'CHECKOUT_REQUESTED');
-  assert.equal(checkout.bill.baseFee, 2000);
-  assert.ok(checkout.bill.total >= 2000);
+  assert.equal(checkout.bill.baseFee, 1000, 'Motorcycle under one hour is Rp1.000');
+  assert.ok(checkout.bill.total >= 1000);
 
   // 6. Pay bill
   const paid = await processPayment({
@@ -97,7 +100,7 @@ async function runSelfCheck() {
 
   // Quota should be restored
   const { zones: zonesAfterExit } = await getZonesWithOccupancy();
-  const zoneFinal = zonesAfterExit.find((z) => z.id === 'zone-a');
+  const zoneFinal = zonesAfterExit.find((z) => z.id === zoneId);
   assert.equal(zoneFinal.available, initialAvailable, 'Zone quota should be restored after exit');
 
   console.log('All store assertions passed cleanly!');

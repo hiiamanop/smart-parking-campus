@@ -9,10 +9,12 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   </React.StrictMode>
 );
 
-if ('serviceWorker' in navigator) {
+if ('serviceWorker' in navigator && import.meta.env.PROD) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(() => {
-      // SW opsional; installability butuh HTTPS/localhost
-    });
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+} else if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then((registrations) => {
+    for (const r of registrations) r.unregister();
   });
 }

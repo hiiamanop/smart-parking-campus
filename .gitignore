@@ -10,6 +10,10 @@ app/dist/
 client/dist/
 gate/dist/
 dist/
+.vite/
+client/.vite/
+gate/.vite/
+app/.vite/
 
 # Environment (jangan commit API key)
 .env

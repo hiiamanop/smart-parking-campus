@@ -11,10 +11,14 @@ import {
   processZoneScan,
   processPayment,
   processGateOut,
+  createDomain,
+  updateDomain,
+  deleteDomain,
   createZone,
   updateZone,
   deleteZone,
   getAllSessions,
+  getAnalytics,
   adminOverrideGate,
   redisSub,
   EVENT_CHANNEL,
@@ -210,13 +214,45 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Get master faculties and zones with live occupancy
+  // Get master domains and zones with live occupancy
   if (req.method === 'GET' && url.pathname === '/api/zones') {
     try {
       const data = await getZonesWithOccupancy();
       return json(res, 200, { ok: true, ...data });
     } catch (err) {
       return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Create a domain
+  if (req.method === 'POST' && url.pathname === '/api/domains') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const domain = await createDomain(body || {});
+      return json(res, 201, { ok: true, domain });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Update / delete a domain
+  const domainMatch = url.pathname.match(/^\/api\/domains\/([A-Za-z0-9_-]+)$/);
+  if (req.method === 'PUT' && domainMatch) {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const domain = await updateDomain(domainMatch[1], body || {});
+      return json(res, 200, { ok: true, domain });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  if (req.method === 'DELETE' && domainMatch) {
+    try {
+      const domain = await deleteDomain(domainMatch[1]);
+      return json(res, 200, { ok: true, domain });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
     }
   }
 
@@ -260,6 +296,16 @@ const server = http.createServer(async (req, res) => {
     try {
       const sessions = await getAllSessions();
       return json(res, 200, { ok: true, sessions });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Activity analytics & preventive-maintenance priorities
+  if (req.method === 'GET' && url.pathname === '/api/admin/analytics') {
+    try {
+      const analytics = await getAnalytics();
+      return json(res, 200, { ok: true, ...analytics });
     } catch (err) {
       return json(res, 500, { ok: false, error: err?.message || String(err) });
     }

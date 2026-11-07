@@ -1,13 +1,14 @@
-export interface Faculty {
+export interface Domain {
   id: string;
   name: string;
-  defaultZoneId: string;
+  description?: string;
 }
 
 export interface Zone {
   id: string;
   name: string;
-  facultyId: string;
+  domainId: string;
+  vehicleType: 'car' | 'motorcycle';
   capacity: number;
   occupied: number;
   available: number;
@@ -76,4 +77,83 @@ export interface LiveEvent {
   type: string;
   payload: any;
   timestamp: string;
+}
+
+export interface ZoneAnalytics {
+  zoneId: string;
+  zoneName: string;
+  domainId: string;
+  capacity: number;
+  occupied: number;
+  available: number;
+  occupancyRate: number;
+  bookings: number;
+  entries: number;
+  exits: number;
+  manualOverrides: number;
+  mismatches: number;
+  zoneViolations: number;
+  revenue: number;
+  payments: number;
+  revenueMotorcycle: number;
+  revenueCar: number;
+  activity: number;
+  lastActivity: string | null;
+  maintenanceScore: number;
+  priority: 'tinggi' | 'sedang' | 'rendah';
+  checkIntervalDays: number;
+}
+
+export interface DomainAnalytics {
+  domainId: string;
+  domainName: string;
+  zones: number;
+  capacity: number;
+  occupied: number;
+  occupancyRate: number;
+  activity: number;
+  manualOverrides: number;
+  mismatches: number;
+  zoneViolations: number;
+  topScore: number;
+}
+
+export interface Analytics {
+  generatedAt: string;
+  totals: {
+    activity: number;
+    entries: number;
+    exits: number;
+    manualOverrides: number;
+    mismatches: number;
+    zoneViolations: number;
+    revenue: number;
+    payments: number;
+    highPriorityZones: number;
+  };
+  zones: ZoneAnalytics[];
+  domains: DomainAnalytics[];
+  hours: Array<{ hour: string; activity: number }>;
+  peakHours: Array<{ hour: string; activity: number }>;
+  finance: {
+    totalRevenue: number;
+    totalPayments: number;
+    byVehicle: { motorcycle: number; car: number };
+    byZone: Array<{
+      zoneId: string;
+      zoneName: string;
+      domainId: string;
+      revenue: number;
+      payments: number;
+      average: number;
+    }>;
+    byDomain: Array<{
+      domainId: string;
+      domainName: string;
+      revenue: number;
+      payments: number;
+      average: number;
+    }>;
+    daily: Array<{ date: string; revenue: number }>;
+  };
 }

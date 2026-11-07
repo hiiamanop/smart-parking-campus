@@ -24,14 +24,20 @@ async function runApiTest() {
   // 2. Get zones
   const zonesRes = await request('/api/zones');
   assert.equal(zonesRes.status, 200);
-  assert.ok(zonesRes.data.zones.length >= 4);
+  assert.ok(zonesRes.data.zones.length >= 1);
+  assert.ok(zonesRes.data.domains.length >= 1);
+
+  const targetZone = zonesRes.data.zones.find(
+    (z) => !z.isFull && (z.vehicleType || 'motorcycle') === 'motorcycle'
+  );
+  assert.ok(targetZone, 'At least one zone with capacity should exist');
 
   // 3. Create booking
   const bookRes = await request('/api/bookings', {
     method: 'POST',
     body: JSON.stringify({
-      facultyId: 'FASILKOM',
-      zoneId: 'zone-d',
+      domainId: targetZone.domainId,
+      zoneId: targetZone.id,
       userName: 'Api Tester',
       vehicleType: 'motorcycle',
       eta: '10:00',
@@ -59,7 +65,7 @@ async function runApiTest() {
     method: 'POST',
     body: JSON.stringify({
       sessionCode: session.sessionCode,
-      scannedZoneId: 'zone-d',
+      scannedZoneId: targetZone.id,
       action: 'confirm_park',
     }),
   });
@@ -71,13 +77,14 @@ async function runApiTest() {
     method: 'POST',
     body: JSON.stringify({
       sessionCode: session.sessionCode,
-      scannedZoneId: 'zone-d',
+      scannedZoneId: targetZone.id,
       action: 'checkout',
     }),
   });
   assert.equal(checkoutRes.status, 200);
   assert.equal(checkoutRes.data.session.status, 'CHECKOUT_REQUESTED');
-  assert.ok(checkoutRes.data.session.bill.total >= 2000);
+  // Motorcycle under one hour is billed Rp1.000 (tiered pricing)
+  assert.ok(checkoutRes.data.session.bill.total >= 1000);
 
   // 7. Payment
   const payRes = await request('/api/payments/pay', {

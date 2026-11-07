@@ -10,18 +10,24 @@ interface SessionMonitorProps {
 export function SessionMonitor({ zones, lastUpdateTimestamp }: SessionMonitorProps) {
   const [sessions, setSessions] = useState<ParkingSession[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState<string>('all');
 
   const loadSessions = () => {
     setLoading(true);
     fetchAdminSessions()
-      .then(setSessions)
-      .catch((err) => console.error('Failed to load admin sessions', err))
+      .then((data) => {
+        setSessions(data);
+        setError(null);
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => {
     loadSessions();
+    const iv = setInterval(loadSessions, 15000);
+    return () => clearInterval(iv);
   }, [lastUpdateTimestamp]);
 
   const filtered = filterStatus === 'all'
@@ -109,9 +115,10 @@ export function SessionMonitor({ zones, lastUpdateTimestamp }: SessionMonitorPro
       </div>
 
       <section className="card">
+        {error && <div className="alert alert-err">Gagal memuat sesi: {error}</div>}
         {filtered.length === 0 ? (
           <p className="hint-text" style={{ textAlign: 'center', padding: 20 }}>
-            Belum ada sesi parkir yang cocok dengan filter.
+            {error ? 'Data sesi tidak dapat diambil dari server.' : 'Belum ada sesi parkir yang cocok dengan filter.'}
           </p>
         ) : (
           <div style={{ overflowX: 'auto' }}>
