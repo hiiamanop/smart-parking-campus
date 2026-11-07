@@ -11,6 +11,7 @@ import { SessionMonitor } from './components/admin/SessionMonitor';
 import { AnalyticsPanel } from './components/admin/AnalyticsPanel';
 import { LiveEventLog } from './components/admin/LiveEventLog';
 import { VlmTestView } from './components/VlmTestView';
+import { OperatorAssistant } from './components/admin/OperatorAssistant';
 
 type AdminTab = 'overview' | 'domains' | 'zones' | 'qr-signs' | 'analytics' | 'sessions' | 'logs' | 'vlm' | 'profile';
 
@@ -163,7 +164,14 @@ function SidebarIcon({ name }: { name: string }) {
 
 const TAB_STORAGE_KEY = 'smart_parking_admin_tab';
 
+function tabFromHash(): AdminTab | null {
+  const raw = window.location.hash.replace(/^#\/?/, '');
+  return TABS.some((t) => t.id === raw) ? (raw as AdminTab) : null;
+}
+
 function readInitialTab(): AdminTab {
+  const fromHash = tabFromHash();
+  if (fromHash) return fromHash;
   try {
     const saved = localStorage.getItem(TAB_STORAGE_KEY) as AdminTab | null;
     if (saved && TABS.some((t) => t.id === saved)) return saved;
@@ -180,6 +188,21 @@ export function App() {
       localStorage.setItem(TAB_STORAGE_KEY, tab);
     } catch {}
   };
+
+  // Sync the active tab with the URL hash so browser back/forward and deep links work.
+  useEffect(() => {
+    const target = `#/${activeTab}`;
+    if (window.location.hash !== target) window.location.hash = target;
+  }, [activeTab]);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const tab = tabFromHash();
+      if (tab && tab !== activeTab) setActiveTabState(tab);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, [activeTab]);
   const [domains, setDomains] = useState<Domain[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
   const [redisConnected, setRedisConnected] = useState<boolean>(false);
@@ -272,7 +295,7 @@ export function App() {
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar no-print">
         <div className="brand">
-          <img className="brand-logo" src="/logo-itb.png" alt="Logo ITB" />
+          <img className="brand-logo" src="/lencana-parkir-pintar.png" alt="Parkir Pintar ITB" />
           <div className="brand-text">
             <div className="brand-name">Smart Parking</div>
             <div className="brand-sub">Konsol admin kampus</div>
@@ -433,6 +456,8 @@ export function App() {
           {activeTab === 'vlm' && <VlmTestView />}
         </div>
       </div>
+
+      <OperatorAssistant onApplied={loadData} />
     </div>
   );
 }

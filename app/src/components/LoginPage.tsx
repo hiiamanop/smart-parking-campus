@@ -38,7 +38,7 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
   return (
     <div className="login-shell">
       <form className="login-card" onSubmit={submit}>
-        <img className="login-logo" src="/logo-itb.png" alt="Logo ITB" />
+        <img className="login-logo" src="/lencana-parkir-pintar.png" alt="Parkir Pintar ITB" />
         <h1>Masuk dashboard</h1>
         <p className="hint-text">
           Smart Parking Kampus · konsol admin. Masukkan token admin yang dikonfigurasi di server.

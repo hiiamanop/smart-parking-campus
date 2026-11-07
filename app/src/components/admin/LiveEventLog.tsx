@@ -11,9 +11,17 @@ export function LiveEventLog({ events, onClear }: LiveEventLogProps) {
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [history, setHistory] = useState<LiveEvent[] | null>(null);
+  const [initial, setInitial] = useState<LiveEvent[]>([]);
   const [loading, setLoading] = useState(false);
 
   const filtering = Boolean(from || to);
+
+  // Load the recent event log from Redis so the page is not empty while waiting for live events.
+  useEffect(() => {
+    fetchEventHistory()
+      .then(setInitial)
+      .catch(() => setInitial([]));
+  }, []);
 
   useEffect(() => {
     if (!filtering) {
@@ -27,7 +35,11 @@ export function LiveEventLog({ events, onClear }: LiveEventLogProps) {
       .finally(() => setLoading(false));
   }, [from, to, filtering]);
 
-  const shown = filtering ? history ?? [] : events;
+  const eventKey = (evt: LiveEvent) => `${evt.timestamp}|${evt.type}|${JSON.stringify(evt.payload)}`;
+  const liveKeys = new Set(events.map(eventKey));
+  const shown = filtering
+    ? history ?? []
+    : [...events, ...initial.filter((evt) => !liveKeys.has(eventKey(evt)))].slice(0, 200);
 
   return (
     <div className="admin-live-log">
@@ -63,7 +75,14 @@ export function LiveEventLog({ events, onClear }: LiveEventLogProps) {
             </button>
           )}
           {!filtering && (
-            <button type="button" className="secondary btn-sm" onClick={onClear}>
+            <button
+              type="button"
+              className="secondary btn-sm"
+              onClick={() => {
+                setInitial([]);
+                onClear();
+              }}
+            >
               Bersihkan log
             </button>
           )}

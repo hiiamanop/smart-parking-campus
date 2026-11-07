@@ -185,7 +185,7 @@ export function App() {
     <div className="mobile-app">
       <header className="mobile-header">
         <div className="brand-block">
-          <img className="brand-logo" src="/logo-itb.png" alt="Logo ITB" />
+          <img className="brand-logo" src="/lencana-parkir-pintar.png" alt="Parkir Pintar ITB" />
           <div>
             <div className="brand-name">Parkir Kampus</div>
             <div className="brand-date">

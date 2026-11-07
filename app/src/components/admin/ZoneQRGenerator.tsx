@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import type { Domain, Zone } from '../../types';
 import { QrImage } from '../QrImage';
 
@@ -9,10 +9,38 @@ interface ZoneQRGeneratorProps {
 
 export function ZoneQRGenerator({ domains, zones }: ZoneQRGeneratorProps) {
   const [selectedDomainId, setSelectedDomainId] = useState<string>('all');
+  const gridRef = useRef<HTMLDivElement>(null);
+  const [twoRowHeight, setTwoRowHeight] = useState<number | undefined>(undefined);
 
   const filteredZones = selectedDomainId === 'all'
     ? zones
     : zones.filter((z) => z.domainId === selectedDomainId);
+
+  // Only cap the grid height (and enable scrolling) when the cards exceed two rows.
+  useLayoutEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    const measure = () => {
+      const cards = Array.from(grid.querySelectorAll<HTMLElement>('.qr-signpost-plate'));
+      if (cards.length === 0) {
+        setTwoRowHeight(undefined);
+        return;
+      }
+      const styles = getComputedStyle(grid);
+      const gap = parseFloat(styles.rowGap) || 18;
+      const columns = styles.gridTemplateColumns.split(' ').filter(Boolean).length || 1;
+      const rows = Math.ceil(cards.length / columns);
+      if (rows <= 2) {
+        setTwoRowHeight(undefined);
+        return;
+      }
+      const tallest = Math.max(...cards.map((c) => c.offsetHeight));
+      setTwoRowHeight(Math.round(tallest * 2 + gap));
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [filteredZones.length]);
 
   // Print hanya satu lembar QR lewat iframe terisolasi,
   // supaya dialog cetak tidak ikut membawa seluruh dashboard.
@@ -123,7 +151,11 @@ export function ZoneQRGenerator({ domains, zones }: ZoneQRGeneratorProps) {
         </label>
       </div>
 
-      <div className="printable-qr-grid">
+      <div
+        className="printable-qr-grid"
+        ref={gridRef}
+        style={twoRowHeight ? { maxHeight: twoRowHeight } : undefined}
+      >
         {filteredZones.map((z) => {
           const domain = domains.find((d) => d.id === z.domainId);
           const qrPayload = `CAMPUS-ZONE-${z.id}`;
