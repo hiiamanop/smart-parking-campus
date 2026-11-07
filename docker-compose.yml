@@ -1,0 +1,26 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smart-parking-web:latest
+    container_name: smart-parking-web
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      VLM_PROXY_HOST: 0.0.0.0
+      VLM_PROXY_PORT: 8788
+      STATIC_DIR: /app/app/dist
+      # Nama service Supabase di network supabase_default (tanpa lewat Cloudflare/CORS).
+      SUPABASE_URL: http://api-gw:8000
+    ports:
+      # Hanya untuk akses lokal/tes. Publik lewat Cloudflare Tunnel.
+      - "127.0.0.1:8788:8788"
+    networks:
+      - supabase
+
+networks:
+  supabase:
+    external: true
+    name: supabase_default
