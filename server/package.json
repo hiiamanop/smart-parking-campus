@@ -1,0 +1,11 @@
+{
+  "name": "smart-parking-vlm-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Proxy lokal untuk OpenRouter VLM (plat nomor) - menjaga API key di server.",
+  "scripts": {
+    "dev": "node --watch server.mjs",
+    "start": "node server.mjs"
+  }
+}
