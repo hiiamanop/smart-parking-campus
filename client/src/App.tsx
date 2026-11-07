@@ -49,6 +49,7 @@ export function App() {
   const [zones, setZones] = useState<Zone[]>([]);
   const [redisLive, setRedisLive] = useState(false);
   const [exitNotice, setExitNotice] = useState<string | null>(null);
+  const [now, setNow] = useState<Date>(new Date());
 
   // Active Parking Session in localStorage
   const [activeSession, setActiveSession] = useState<ParkingSession | null>(() => {
@@ -67,6 +68,12 @@ export function App() {
       else localStorage.removeItem('smart_parking_driver_real_session');
     } catch {}
   };
+
+  // Live clock for header
+  useEffect(() => {
+    const iv = setInterval(() => setNow(new Date()), 30000);
+    return () => clearInterval(iv);
+  }, []);
 
   // Load Zones Master Data
   useEffect(() => {
@@ -155,14 +162,10 @@ export function App() {
       {/* Top Profile Header (Matches Image #1) */}
       <header className="mobile-header">
         <div className="profile-group">
-          <img
-            className="profile-avatar"
-            src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80"
-            alt="Profile Avatar"
-          />
-          <div>
-            <div className="profile-name-text">Pengemudi (Anonim)</div>
-            <div className="profile-date-text">Oct 29, Wednesday</div>
+          <div className="profile-date-text" id="live-clock">
+            {now.toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+            {' · '}
+            {now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
           </div>
         </div>
 
