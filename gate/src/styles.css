@@ -66,6 +66,17 @@ body {
   background: #22c55e;
   animation: pulse-dot 1.5s infinite;
 }
+.kiosk-pill-live.offline {
+  background: #450a0a;
+  color: #fca5a5;
+  border-color: #ef4444;
+}
+.pulse-circle-red {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ef4444;
+}
 @keyframes pulse-dot {
   0% { transform: scale(0.9); opacity: 0.8; }
   50% { transform: scale(1.3); opacity: 1; }
@@ -313,3 +324,28 @@ body {
 }
 .alert-terminal.ok { background: #052e16; border: 1px solid #22c55e; color: #86efac; }
 .alert-terminal.err { background: #450a0a; border: 1px solid #ef4444; color: #fca5a5; }
+.alert-terminal.warn { background: #422006; border: 1px solid #f59e0b; color: #fcd34d; }
+
+.camera-diag {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.camera-diag span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.camera-diag .diag-ok { background: #052e16; border-color: #22c55e; color: #86efac; }
+.camera-diag .diag-bad { background: #450a0a; border-color: #ef4444; color: #fca5a5; }
+.camera-diag .diag-neutral { background: #1e293b; border-color: #475569; color: #cbd5e1; }
+
+.detector-status {
+  font-size: 11px;
+  color: #94a3b8;
+  font-weight: 600;
+  margin-top: 4px;
+}

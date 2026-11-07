@@ -1,4 +1,4 @@
-const CACHE = 'smart-parking-gate-v1';
+const CACHE = 'smart-parking-gate-v4';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/icon.svg'];
 
 self.addEventListener('install', (event) => {

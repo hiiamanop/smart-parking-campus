@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import jsQR from 'jsqr';
+import { loadPlateDetector, getDetectorSession, detectPlate, cropPlate, type PlateBox } from './plateDetector';
 
 type PipelineStep = '1_SCANNING_QR' | '2_READING_PLATE_VLM' | '3_SAVING_OPENING' | '4_GATE_OPENED';
 
@@ -13,6 +14,14 @@ export function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraDiag, setCameraDiag] = useState<{ secure: boolean; mediaDevices: boolean; permission: string }>({ secure: true, mediaDevices: true, permission: 'unknown' });
+
+  // On-device plate detector (ONNX) state
+  const [detectorReady, setDetectorReady] = useState(false);
+  const [detectorLoading, setDetectorLoading] = useState(false);
+  const [detectorError, setDetectorError] = useState<string | null>(null);
+  const detectorSessionRef = useRef<any>(null);
+  const consecutiveDetectRef = useRef(0);
 
   // Automated workflow state
   const [detectedQrCode, setDetectedQrCode] = useState<string | null>(null);
@@ -27,8 +36,219 @@ export function App() {
   // Ref to prevent multiple concurrent triggers
   const isProcessingRef = useRef(false);
 
+  // Standby plate-reading loop state
+  const [plateStandby, setPlateStandby] = useState(false);
+  const [plateAttempt, setPlateAttempt] = useState(0);
+  const [pendingCode, setPendingCode] = useState<string | null>(null);
+  const standbyRef = useRef<{ cancelled: boolean; timer: number }>({ cancelled: false, timer: 0 });
+
+  const STANDBY_FRAME_MS = 900;   // jeda antar frame
+  const FRAMES_PER_SEND = 3;      // kirim frame terbaik tiap ~3 frame
+  const MAX_VLM_ATTEMPTS = 4;     // batas panggilan VLM per scan
+  const MIN_SHARPNESS = 6;        // frame terlalu blur tidak dikirim
+
+  // Ambil frame dari video + ukur ketajaman (Laplacian variance)
+  const grabFrame = (): { dataUrl: string; sharpness: number } => {
+    const v = videoRef.current;
+    const c = canvasRef.current;
+    if (!v || !c || !v.videoWidth || v.readyState < 2) return { dataUrl: '', sharpness: 0 };
+
+    const w = Math.min(v.videoWidth, 960);
+    const h = Math.round((v.videoHeight || 720) * (w / (v.videoWidth || w)));
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d');
+    if (!ctx) return { dataUrl: '', sharpness: 0 };
+    ctx.drawImage(v, 0, 0, w, h);
+
+    const data = ctx.getImageData(0, 0, w, h).data;
+    const step = Math.max(1, Math.round(w / 240));
+    const gw = Math.floor(w / step);
+    const gh = Math.floor(h / step);
+    if (gw < 3 || gh < 3) return { dataUrl: c.toDataURL('image/jpeg', 0.85), sharpness: 0 };
+
+    const gray = new Float32Array(gw * gh);
+    for (let y = 0; y < gh; y++) {
+      for (let x = 0; x < gw; x++) {
+        const i = (y * step * w + x * step) * 4;
+        gray[y * gw + x] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      }
+    }
+    let sum = 0;
+    let sumSq = 0;
+    let n = 0;
+    for (let y = 1; y < gh - 1; y++) {
+      for (let x = 1; x < gw - 1; x++) {
+        const lap =
+          4 * gray[y * gw + x] -
+          gray[(y - 1) * gw + x] - gray[(y + 1) * gw + x] -
+          gray[y * gw + x - 1] - gray[y * gw + x + 1];
+        sum += lap;
+        sumSq += lap * lap;
+        n++;
+      }
+    }
+    const mean = n ? sum / n : 0;
+    return { dataUrl: c.toDataURL('image/jpeg', 0.85), sharpness: n ? sumSq / n - mean * mean : 0 };
+  };
+
+  const stopPlateStandby = useCallback(() => {
+    standbyRef.current.cancelled = true;
+    if (standbyRef.current.timer) window.clearTimeout(standbyRef.current.timer);
+    standbyRef.current.timer = 0;
+    setPlateStandby(false);
+  }, []);
+
+  // Kirim satu frame ke VLM, kembalikan plat (atau null)
+  const requestVlmPlate = async (dataUrl: string): Promise<{ plate: string | null; error?: string }> => {
+    const m = dataUrl.match(/^data:(.*?);base64,(.*)$/);
+    const mimeType = m?.[1] || 'image/jpeg';
+    const imageBase64 = m?.[2] || dataUrl;
+    const res = await fetch('/api/vlm/plate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64, mimeType, context: gateMode }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) return { plate: null, error: data?.error || 'VLM gagal membaca gambar' };
+    return { plate: data.result?.plate || null };
+  };
+
+  // Standby: kamera tetap live, deteksi plat on-device (ONNX) lalu kirim crop ke VLM;
+  // fallback ke pengiriman frame berkala jika model belum siap / tidak mendeteksi.
+  const startPlateStandby = (code: string) => {
+    stopPlateStandby();
+    setPendingCode(code);
+    setPlateStandby(true);
+    setPlateAttempt(0);
+    setVlmPlate(null);
+    setSnapshotDataUrl(null);
+    setGateOpen(false);
+    setErrorText(null);
+    setCurrentStep('2_READING_PLATE_VLM');
+    setStatusText('QR terverifikasi. Arahkan plat nomor ke kamera — AI standby menunggu plat terbaca...');
+
+    standbyRef.current = { cancelled: false, timer: 0 };
+    consecutiveDetectRef.current = 0;
+    let attempt = 0;
+    let frames = 0;
+    let best: { dataUrl: string; sharpness: number } = { dataUrl: '', sharpness: -1 };
+
+    const schedule = (ms: number) => {
+      standbyRef.current.timer = window.setTimeout(tick, ms);
+    };
+
+    const trySend = async (dataUrl: string): Promise<boolean> => {
+      attempt++;
+      setPlateAttempt(attempt);
+      setStatusText(`AI membaca plat... percobaan ${attempt}/${MAX_VLM_ATTEMPTS}`);
+      try {
+        const { plate, error } = await requestVlmPlate(dataUrl);
+        if (standbyRef.current.cancelled) return true;
+        if (plate) {
+          stopPlateStandby();
+          setSnapshotDataUrl(dataUrl);
+          setVlmPlate(plate);
+          await savePlateAndOpenGate(code, plate);
+          return true;
+        }
+        if (attempt >= MAX_VLM_ATTEMPTS) {
+          setSnapshotDataUrl(dataUrl);
+          stopPlateStandby();
+          setStatusText('Standby plat dihentikan. Menunggu tindakan operator.');
+          setErrorText(
+            `Plat belum terbaca setelah ${attempt} percobaan (${error || 'plat tidak terdeteksi'}). ` +
+            'Pastikan plat terlihat jelas dan tidak blur, lalu tekan "Baca Plat Lagi" atau gunakan Upload Foto.'
+          );
+          return true;
+        }
+        setStatusText(`Plat belum terbaca (percobaan ${attempt}/${MAX_VLM_ATTEMPTS}). Tetap standby...`);
+        return false;
+      } catch (err: any) {
+        if (standbyRef.current.cancelled) return true;
+        setStatusText(`Gagal menghubungi AI (${err?.message || 'error'}). Tetap standby...`);
+        return false;
+      }
+    };
+
+    const tick = async () => {
+      if (standbyRef.current.cancelled) return;
+      if (!videoRef.current || videoRef.current.readyState < 2) {
+        setStatusText('Kamera belum siap — menunggu stream video...');
+        schedule(STANDBY_FRAME_MS);
+        return;
+      }
+
+      frames++;
+      const frame = grabFrame();
+      if (frame.dataUrl && frame.sharpness > best.sharpness) best = frame;
+
+      // 1) On-device detector: bila plat terdeteksi stabil -> crop & kirim ke VLM
+      if (detectorSessionRef.current && frames % 2 === 0) {
+        try {
+          const box = await detectPlate(detectorSessionRef.current, videoRef.current, 0.4);
+          if (box) {
+            consecutiveDetectRef.current += 1;
+            setStatusText(`Plat terdeteksi (${Math.round(box.conf * 100)}%). Menstabilkan...`);
+            if (consecutiveDetectRef.current >= 2) {
+              const crop = cropPlate(videoRef.current, box);
+              if (crop) {
+                consecutiveDetectRef.current = 0;
+                const done = await trySend(crop);
+                if (done || standbyRef.current.cancelled) return;
+              }
+            }
+          } else {
+            consecutiveDetectRef.current = 0;
+          }
+        } catch (e) {
+          consecutiveDetectRef.current = 0;
+        }
+      }
+
+      // 2) Fallback: kirim frame terbaik berkala bila detector belum siap / tidak mendeteksi
+      if (frames % FRAMES_PER_SEND === 0 && best.dataUrl && best.sharpness >= MIN_SHARPNESS) {
+        const shot = best.dataUrl;
+        best = { dataUrl: '', sharpness: -1 };
+        consecutiveDetectRef.current = 0;
+        const done = await trySend(shot);
+        if (done || standbyRef.current.cancelled) return;
+      }
+
+      schedule(STANDBY_FRAME_MS);
+    };
+
+    schedule(300);
+  };
+
+
+  // Read current camera permission state (best-effort; some browsers don't support it)
+  const readPermission = useCallback(async () => {
+    try {
+      const p = await (navigator.permissions as any)?.query?.({ name: 'camera' });
+      return p?.state || 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }, []);
+
   // Initialize and start live camera on mount or mode change
   const startCamera = useCallback(async () => {
+    const secure = window.isSecureContext;
+    const hasMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    const permission = await readPermission();
+    setCameraDiag({ secure, mediaDevices: hasMedia, permission });
+
+    if (!secure || !hasMedia) {
+      setCameraError(
+        'Halaman ini tidak aman (HTTP). Browser hanya mengizinkan kamera di HTTPS atau localhost, ' +
+        'jadi tombol izin kamera tidak akan muncul. Buka lewat https://gate-parkir.hiiamanop.my.id, ' +
+        'atau pakai tombol "Unggah Foto" di bawah.'
+      );
+      setCameraActive(false);
+      return;
+    }
+
     try {
       setCameraError(null);
       if (streamRef.current) {
@@ -49,12 +269,34 @@ export function App() {
         await videoRef.current.play();
         setCameraActive(true);
       }
+      setCameraDiag({ secure: true, mediaDevices: true, permission: 'granted' });
     } catch (err: any) {
       console.warn('Webcam stream error', err);
-      setCameraError('Kamera tidak dapat diakses langsung. Anda dapat menggunakan fitur upload foto atau mengizinkan akses kamera browser.');
+      const name = err?.name || '';
+      const messages: Record<string, string> = {
+        NotAllowedError:
+          'Izin kamera ditolak. Klik ikon kamera/kunci di address bar -> Site settings -> Camera: Allow, ' +
+          'lalu tekan "Restart Kamera".',
+        PermissionDeniedError:
+          'Izin kamera ditolak. Klik ikon kamera/kunci di address bar -> Site settings -> Camera: Allow, ' +
+          'lalu tekan "Restart Kamera".',
+        NotFoundError: 'Tidak ada kamera terdeteksi di perangkat ini.',
+        DevicesNotFoundError: 'Tidak ada kamera terdeteksi di perangkat ini.',
+        NotReadableError:
+          'Kamera sedang dipakai aplikasi lain (Zoom/Meet/Teams). Tutup aplikasi tersebut lalu tekan "Restart Kamera".',
+        TrackStartError:
+          'Kamera sedang dipakai aplikasi lain. Tutup aplikasi tersebut lalu tekan "Restart Kamera".',
+        OverconstrainedError: 'Kamera tidak mendukung resolusi yang diminta. Coba tekan "Restart Kamera".',
+        SecurityError: 'Akses kamera diblokir oleh kebijakan browser/perangkat.',
+      };
+      setCameraError(
+        messages[name] ||
+        `Kamera tidak dapat diakses (${name || 'unknown'}). Anda dapat menggunakan fitur upload foto atau mengizinkan akses kamera browser.`
+      );
+      setCameraDiag({ secure, mediaDevices: hasMedia, permission: await readPermission() });
       setCameraActive(false);
     }
-  }, []);
+  }, [readPermission]);
 
   useEffect(() => {
     startCamera();
@@ -64,6 +306,31 @@ export function App() {
       }
     };
   }, [startCamera]);
+
+  // Muat model deteksi plat (ONNX) di background
+  useEffect(() => {
+    let cancelled = false;
+    setDetectorLoading(true);
+    loadPlateDetector()
+      .then((sess) => {
+        if (cancelled) return;
+        if (sess) {
+          detectorSessionRef.current = sess;
+          setDetectorReady(true);
+          setDetectorError(null);
+        } else {
+          setDetectorError('Model deteksi plat gagal dimuat. Tetap pakai mode VLM langsung.');
+        }
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setDetectorError(`Model deteksi plat error: ${e?.message || e}`);
+      })
+      .finally(() => {
+        if (!cancelled) setDetectorLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   // Clean code extraction helper (handles e.g. "SP-A1B2", "#SP-A1B2", "OUT-7C1D", JSON, URL)
   const extractCode = (raw: string): string => {
@@ -169,31 +436,23 @@ export function App() {
   };
 
   // Pipeline Step 1: Triggered automatically when jsQR finds a QR code
-  const onQrCodeDetected = async (rawCode: string) => {
+  const onQrCodeDetected = async (rawCode: string, providedImage?: string) => {
     if (isProcessingRef.current) return;
     isProcessingRef.current = true;
 
     const clean = extractCode(rawCode);
     setDetectedQrCode(clean);
-    setStatusText(`QR Terdeteksi: ${clean}. Mengambil snapshot kamera untuk AI VLM...`);
 
-    // Capture current live frame from video
-    let snapshot = '';
-    if (videoRef.current && canvasRef.current) {
-      const v = videoRef.current;
-      const c = canvasRef.current;
-      c.width = v.videoWidth || 640;
-      c.height = v.videoHeight || 480;
-      const ctx = c.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(v, 0, 0, c.width, c.height);
-        snapshot = c.toDataURL('image/jpeg', 0.85);
-        setSnapshotDataUrl(snapshot);
-      }
+    if (providedImage) {
+      // Dari upload foto: langsung kirim gambar itu ke VLM
+      setSnapshotDataUrl(providedImage);
+      setStatusText(`QR Terdeteksi: ${clean}. Mengirim foto ke AI VLM...`);
+      await processVlmPlateCapture(clean, providedImage);
+      return;
     }
 
-    // Immediately call VLM sequentially!
-    await processVlmPlateCapture(clean, snapshot);
+    // Dari kamera live: standby sampai plat benar-benar terbaca
+    startPlateStandby(clean);
   };
 
   // Continuous Camera Scanning Loop for QR code
@@ -236,12 +495,15 @@ export function App() {
 
   // Reset entire pipeline
   const resetPipeline = () => {
+    stopPlateStandby();
     isProcessingRef.current = false;
-    setDetectedQrCode(null);
+    consecutiveDetectRef.current = 0;
     setVlmPlate(null);
     setSnapshotDataUrl(null);
     setGateOpen(false);
     setErrorText(null);
+    setPlateAttempt(0);
+    setPendingCode(null);
     setCurrentStep('1_SCANNING_QR');
     setStatusText('Arahkan QR Tiket ke Kamera Gate...');
   };
@@ -268,7 +530,7 @@ export function App() {
           const imgData = ctx.getImageData(0, 0, c.width, c.height);
           const qr = jsQR(imgData.data, imgData.width, imgData.height);
           if (qr && qr.data) {
-            onQrCodeDetected(qr.data);
+            onQrCodeDetected(qr.data, dataUrl);
           } else {
             setErrorText('QR Code tidak ditemukan di foto. Pastikan QR terlihat jelas.');
           }
@@ -292,9 +554,9 @@ export function App() {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <div className="kiosk-pill-live">
-            <span className="pulse-circle-green" />
-            <span>Kamera &amp; VLM Aktif</span>
+          <div className={`kiosk-pill-live ${cameraActive ? '' : 'offline'}`}>
+            <span className={cameraActive ? 'pulse-circle-green' : 'pulse-circle-red'} />
+            <span>{cameraActive ? 'Kamera & VLM Aktif' : 'Kamera Nonaktif — Pakai Upload Foto'}</span>
           </div>
 
           <div className="mode-toggle-group">
@@ -345,7 +607,11 @@ export function App() {
         <div className={`pipeline-step ${currentStep === '2_READING_PLATE_VLM' ? 'active' : currentStep === '3_SAVING_OPENING' || currentStep === '4_GATE_OPENED' ? 'completed' : ''}`}>
           <div className="pipeline-step-num">Tahap 2 (Otomatis)</div>
           <div className="pipeline-step-title">
-            {vlmPlate ? `✓ Plat: ${vlmPlate}` : '2. AI VLM Baca Plat'}
+            {vlmPlate
+              ? `✓ Plat: ${vlmPlate}`
+              : plateStandby
+              ? `2. Standby plat… (${plateAttempt}/${MAX_VLM_ATTEMPTS})`
+              : '2. AI VLM Baca Plat'}
           </div>
         </div>
 
@@ -360,6 +626,23 @@ export function App() {
       {errorText && (
         <div className="alert-terminal err">
           <strong>Perhatian: </strong>{errorText}
+        </div>
+      )}
+
+      {cameraError && (
+        <div className="alert-terminal warn">
+          <strong>Kamera tidak aktif: </strong>{cameraError}
+          <div className="camera-diag">
+            <span className={cameraDiag.secure ? 'diag-ok' : 'diag-bad'}>
+              HTTPS: {cameraDiag.secure ? 'ya' : 'TIDAK'}
+            </span>
+            <span className={cameraDiag.mediaDevices ? 'diag-ok' : 'diag-bad'}>
+              API kamera: {cameraDiag.mediaDevices ? 'tersedia' : 'tidak tersedia'}
+            </span>
+            <span className={cameraDiag.permission === 'denied' ? 'diag-bad' : 'diag-neutral'}>
+              Izin: {cameraDiag.permission}
+            </span>
+          </div>
         </div>
       )}
 
@@ -386,7 +669,9 @@ export function App() {
             {currentStep === '1_SCANNING_QR'
               ? 'ARAHKAN QR TIKET KE SINI'
               : currentStep === '2_READING_PLATE_VLM'
-              ? '📸 AI VLM SEDANG MEMBACA PLAT...'
+              ? plateStandby
+                ? '📸 ARAHKAN PLAT KE KAMERA — AI STANDBY'
+                : '📸 AI VLM SEDANG MEMBACA PLAT...'
               : 'VERIFIKASI & MEMBUKA PALANG...'}
           </div>
 
@@ -432,6 +717,16 @@ export function App() {
           >
             📹 Restart Kamera
           </button>
+
+          {pendingCode && !plateStandby && !gateOpen && (
+            <button
+              type="button"
+              className="btn-kiosk-action primary"
+              onClick={() => startPlateStandby(pendingCode)}
+            >
+              🎯 Baca Plat Lagi
+            </button>
+          )}
         </div>
 
         <div>
@@ -446,6 +741,9 @@ export function App() {
               style={{ display: 'none' }}
             />
           </label>
+        </div>
+        <div className="detector-status">
+          Deteksi plat on-device: {detectorLoading ? 'memuat model...' : detectorReady ? 'siap (ONNX)' : detectorError || 'tidak aktif'}
         </div>
       </div>
     </div>

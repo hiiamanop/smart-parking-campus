@@ -61,7 +61,7 @@ export function App() {
         <div>
           <div className="row" style={{ gap: 8, marginBottom: 4 }}>
             <h1>Dashboard Admin — Smart Parking Kampus</h1>
-            <span className="badge" style={{ background: '#0f172a', color: '#fff' }}>Port 5173</span>
+            <span className="badge" style={{ background: '#0f172a', color: '#fff' }}>Live</span>
           </div>
           <p className="hint-text" style={{ margin: 0 }}>
             Pusat Kendali Master Data Zona, Generate QR Tiang, Monitoring Kendaraan &amp; Audit Log Redis
@@ -72,7 +72,7 @@ export function App() {
             {redisConnected ? '● Redis Pub/Sub Live' : '○ Redis Reconnecting...'}
           </span>
           <a
-            href="http://localhost:5174"
+            href="https://parkir.hiiamanop.my.id"
             target="_blank"
             rel="noreferrer"
             className="btn secondary btn-sm"

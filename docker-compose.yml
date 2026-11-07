@@ -43,7 +43,7 @@ services:
     depends_on:
       - api
     ports:
-      - "127.0.0.1:8081:8080"
+      - "0.0.0.0:8081:8080"
     networks:
       - supabase
 
@@ -57,7 +57,7 @@ services:
     depends_on:
       - driver
     ports:
-      - "127.0.0.1:8082:8080"
+      - "0.0.0.0:8082:8080"
     networks:
       - supabase
 
@@ -71,7 +71,7 @@ services:
     depends_on:
       - driver
     ports:
-      - "127.0.0.1:8083:8080"
+      - "0.0.0.0:8083:8080"
     networks:
       - supabase
 
