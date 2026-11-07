@@ -720,7 +720,7 @@ function TimelineTicketView({
         <div className="current-row">
           <span className="current-row-label">💳 Transaction Status:</span>
           <span className="current-row-val" style={{ color: activeSession.status === 'PAID' ? '#10b981' : '#f59e0b' }}>
-            {activeSession.status === 'PAID' ? 'Paid (Rp2.000)' : 'Unpaid (Rp2.000)'}
+            {activeSession.status === 'PAID' ? `Paid (Rp${(activeSession.bill?.total ?? 2000).toLocaleString('id-ID')})` : `Unpaid (Rp${(activeSession.bill?.total ?? 2000).toLocaleString('id-ID')})`}
           </span>
         </div>
       </div>
@@ -760,7 +760,7 @@ function TimelineTicketView({
           disabled={loading}
           onClick={handlePay}
         >
-          {loading ? 'Memproses...' : 'Bayar Sekarang (QRIS Rp2.000)'}
+          {loading ? 'Memproses...' : `Bayar Sekarang (QRIS Rp${(activeSession.bill?.total ?? 2000).toLocaleString('id-ID')})`}
         </button>
       )}
 
