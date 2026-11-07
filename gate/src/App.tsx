@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import jsQR from 'jsqr';
-import { loadPlateDetector, getDetectorSession, detectPlate, cropPlate, type PlateBox } from './plateDetector';
+import { loadPlateDetector, getDetectorSession, detectPlate, cropPlate, type PlateBox, loadPlateRecognizer, getRecognizerSession, recognizePlate } from './plateDetector';
 
 type PipelineStep = '1_SCANNING_QR' | '2_READING_PLATE_VLM' | '3_SAVING_OPENING' | '4_GATE_OPENED';
 
@@ -22,6 +22,12 @@ export function App() {
   const [detectorError, setDetectorError] = useState<string | null>(null);
   const detectorSessionRef = useRef<any>(null);
   const consecutiveDetectRef = useRef(0);
+
+  // OCR lokal (recognizer) state
+  const [recognizerReady, setRecognizerReady] = useState(false);
+  const [recognizerLoading, setRecognizerLoading] = useState(false);
+  const [recognizerError, setRecognizerError] = useState<string | null>(null);
+  const recognizerSessionRef = useRef<any>(null);
 
   // Automated workflow state
   const [detectedQrCode, setDetectedQrCode] = useState<string | null>(null);
@@ -140,6 +146,28 @@ export function App() {
 
     const trySend = async (dataUrl: string): Promise<boolean> => {
       attempt++;
+      setPlateAttempt(attempt);
+
+      // 1) Coba OCR lokal dulu (tanpa VLM) bila model siap
+      const recSess = recognizerSessionRef.current;
+      if (recSess) {
+        try {
+          const rec = await recognizePlate(recSess, dataUrl, 0.35);
+          if (standbyRef.current.cancelled) return true;
+          if (rec && rec.text && rec.text.length >= 4 && rec.confidence >= 0.6) {
+            stopPlateStandby();
+            setSnapshotDataUrl(dataUrl);
+            setVlmPlate(rec.text);
+            await savePlateAndOpenGate(code, rec.text);
+            setStatusText(`PLAT ${rec.text} TERBACA LOKAL (conf ${Math.round(rec.confidence*100)}%). PALANG TERBUKA.`);
+            return true;
+          }
+          setStatusText(`OCR lokal: ${rec?.text || 'tidak ada'} (conf ${Math.round((rec?.confidence||0)*100)}%). Lanjut VLM...`);
+        } catch (e) {
+          // fall through to VLM
+        }
+      }
+
       setPlateAttempt(attempt);
       setStatusText(`AI membaca plat... percobaan ${attempt}/${MAX_VLM_ATTEMPTS}`);
       try {
@@ -311,23 +339,22 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     setDetectorLoading(true);
-    loadPlateDetector()
-      .then((sess) => {
+    setRecognizerLoading(true);
+    Promise.all([loadPlateDetector(), loadPlateRecognizer()])
+      .then(([detSess, recSess]) => {
         if (cancelled) return;
-        if (sess) {
-          detectorSessionRef.current = sess;
-          setDetectorReady(true);
-          setDetectorError(null);
-        } else {
-          setDetectorError('Model deteksi plat gagal dimuat. Tetap pakai mode VLM langsung.');
-        }
+        if (detSess) { detectorSessionRef.current = detSess; setDetectorReady(true); setDetectorError(null); }
+        else setDetectorError('Model deteksi plat gagal dimuat. Tetap pakai mode VLM langsung.');
+        if (recSess) { recognizerSessionRef.current = recSess; setRecognizerReady(true); setRecognizerError(null); }
+        else setRecognizerError('Model OCR plat gagal dimuat. VLM tetap dipakai sebagai fallback.');
       })
       .catch((e) => {
         if (cancelled) return;
         setDetectorError(`Model deteksi plat error: ${e?.message || e}`);
+        setRecognizerError(`Model OCR plat error: ${e?.message || e}`);
       })
       .finally(() => {
-        if (!cancelled) setDetectorLoading(false);
+        if (!cancelled) { setDetectorLoading(false); setRecognizerLoading(false); }
       });
     return () => { cancelled = true; };
   }, []);
@@ -743,7 +770,7 @@ export function App() {
           </label>
         </div>
         <div className="detector-status">
-          Deteksi plat on-device: {detectorLoading ? 'memuat model...' : detectorReady ? 'siap (ONNX)' : detectorError || 'tidak aktif'}
+          Deteksi plat on-device: {detectorLoading ? 'memuat model...' : detectorReady ? 'siap (ONNX)' : detectorError || 'tidak aktif'} · OCR lokal: {recognizerLoading ? 'memuat...' : recognizerReady ? 'siap' : recognizerError || 'tidak aktif'}
         </div>
       </div>
     </div>
