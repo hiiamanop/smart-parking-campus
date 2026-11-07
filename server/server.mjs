@@ -1,8 +1,24 @@
 import http from 'node:http';
 import fs from 'node:fs';
-import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  initMasterData,
+  getZonesWithOccupancy,
+  createBooking,
+  getSession,
+  processGateIn,
+  processZoneScan,
+  processPayment,
+  processGateOut,
+  createZone,
+  updateZone,
+  deleteZone,
+  getAllSessions,
+  adminOverrideGate,
+  redisSub,
+  EVENT_CHANNEL,
+} from './store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 loadEnv(path.resolve(__dirname, '../.env'));
@@ -14,9 +30,6 @@ const OPENROUTER_BASE_URL = (process.env.OPENROUTER_BASE_URL || 'https://openrou
 const OPENROUTER_MODEL = process.env.OPENROUTER_VLM_MODEL || 'google/gemini-2.5-flash';
 const SITE_URL = process.env.OPENROUTER_SITE_URL || 'http://localhost:5173';
 const APP_NAME = process.env.OPENROUTER_APP_NAME || 'Smart Parking Kampus';
-const STATIC_DIR = path.resolve(__dirname, process.env.STATIC_DIR || '../app/dist');
-const SUPABASE_URL = (process.env.SUPABASE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
-const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || '';
 
 function loadEnv(file) {
   try {
@@ -29,7 +42,7 @@ function loadEnv(file) {
       process.env[m[1]] = v;
     }
   } catch {
-    // .env opsional; env sistem tetap dipakai
+    // .env optional; system env used as fallback
   }
 }
 
@@ -118,136 +131,75 @@ Jika plat tidak terbaca, isi plate dengan null dan jelaskan di notes.`;
   };
 }
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-  '.ico': 'image/x-icon',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.map': 'application/json; charset=utf-8',
-  '.txt': 'text/plain; charset=utf-8',
-};
+// SSE Connection Management hooked to Redis Pub/Sub
+const sseClients = new Set();
 
-function isInside(root, target) {
-  const rel = path.relative(root, target);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
-}
+redisSub.subscribe(EVENT_CHANNEL, (err) => {
+  if (err) console.error('Redis subscribe error:', err);
+  else console.log(`Redis Subscribed to channel: ${EVENT_CHANNEL}`);
+});
 
-async function serveStatic(req, res, pathname) {
-  let urlPath;
-  try { urlPath = decodeURIComponent(pathname); } catch { return false; }
-  if (urlPath.includes('\0')) return false;
-
-  const requested = path.resolve(STATIC_DIR, `.${urlPath}`);
-  if (!isInside(STATIC_DIR, requested)) return false;
-
-  let filePath = requested;
-  try {
-    const stat = await fsp.stat(filePath);
-    if (stat.isDirectory()) filePath = path.join(filePath, 'index.html');
-  } catch {
-    // SPA fallback: rute tanpa ekstensi diarahkan ke index.html
-    if (path.extname(urlPath)) return false;
-    filePath = path.join(STATIC_DIR, 'index.html');
+redisSub.on('message', (channel, message) => {
+  if (channel === EVENT_CHANNEL) {
+    const sseData = `data: ${message}\n\n`;
+    for (const client of sseClients) {
+      try {
+        client.write(sseData);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
   }
+});
 
-  if (!isInside(STATIC_DIR, filePath)) return false;
-
-  let data;
-  try {
-    data = await fsp.readFile(filePath);
-  } catch {
-    return false;
+// Send keep-alive every 15s to keep connections alive
+setInterval(() => {
+  for (const client of sseClients) {
+    try {
+      client.write(':keepalive\n\n');
+    } catch {
+      sseClients.delete(client);
+    }
   }
-
-  const ext = path.extname(filePath).toLowerCase();
-  const base = path.basename(filePath);
-  const headers = {
-    'Content-Type': MIME[ext] || 'application/octet-stream',
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'strict-origin-when-cross-origin',
-  };
-  if (base === 'index.html' || base === 'sw.js' || ext === '.webmanifest') {
-    headers['Cache-Control'] = 'no-cache';
-  } else if (urlPath.startsWith('/assets/')) {
-    headers['Cache-Control'] = 'public, max-age=31536000, immutable';
-  } else {
-    headers['Cache-Control'] = 'public, max-age=3600';
-  }
-  res.writeHead(200, headers);
-  if (req.method === 'HEAD') return res.end();
-  res.end(data);
-  return true;
-}
+}, 15000);
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'OPTIONS') return json(res, 204, {});
 
+  // Health check
   if (req.method === 'GET' && url.pathname === '/health') {
     return json(res, 200, {
       ok: true,
-      service: 'smart-parking',
       model: OPENROUTER_MODEL,
       hasApiKey: Boolean(OPENROUTER_API_KEY),
-      hasDatabase: Boolean(SUPABASE_KEY),
-      staticDir: STATIC_DIR,
+      activeSseClients: sseClients.size,
     });
   }
 
-  // Proxy database (PostgREST) lewat server sendiri.
-  // Tujuan: kunci Supabase tidak pernah dikirim ke browser + menghindari CORS.
-  if (url.pathname.startsWith('/api/db/')) {
-    if (!['GET', 'POST', 'OPTIONS'].includes(req.method || '')) {
-      return json(res, 405, { ok: false, error: 'Method not allowed' });
-    }
-    if (!SUPABASE_KEY) {
-      return json(res, 503, { ok: false, error: 'SUPABASE_KEY belum diisi di .env' });
-    }
-    const match = url.pathname.match(/^\/api\/db\/(rpc\/[a-z0-9_]+)$/i);
-    if (!match) {
-      return json(res, 404, { ok: false, error: 'Endpoint database tidak diizinkan' });
-    }
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      });
-      return res.end();
-    }
-    try {
-      const body = req.method === 'POST' ? await readBody(req) : undefined;
-      const upstream = await fetch(`${SUPABASE_URL}/rest/v1/${match[1]}`, {
-        method: req.method,
-        headers: {
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`,
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body,
-      });
-      const text = await upstream.text();
-      res.writeHead(upstream.status, {
-        'Content-Type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
-        'Cache-Control': 'no-store',
-      });
-      return res.end(text);
-    } catch (err) {
-      return json(res, 502, { ok: false, error: `Database tidak dapat dihubungi: ${err?.message || err}` });
-    }
+  // SSE Live update stream
+  if (req.method === 'GET' && url.pathname === '/api/events') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.write(':connected\n\n');
+    sseClients.add(res);
+
+    // Send initial snapshot
+    getZonesWithOccupancy().then((data) => {
+      res.write(`data: ${JSON.stringify({ type: 'ZONE_SNAPSHOT', payload: data })}\n\n`);
+    }).catch(() => {});
+
+    req.on('close', () => {
+      sseClients.delete(res);
+    });
+    return;
   }
 
+  // Standalone VLM plate OCR endpoint
   if (req.method === 'POST' && url.pathname === '/api/vlm/plate') {
     try {
       const body = JSON.parse(await readBody(req));
@@ -258,13 +210,190 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'GET' || req.method === 'HEAD') {
-    if (await serveStatic(req, res, url.pathname)) return;
+  // Get master faculties and zones with live occupancy
+  if (req.method === 'GET' && url.pathname === '/api/zones') {
+    try {
+      const data = await getZonesWithOccupancy();
+      return json(res, 200, { ok: true, ...data });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Create new parking zone
+  if (req.method === 'POST' && url.pathname === '/api/zones') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const zone = await createZone(body || {});
+      return json(res, 201, { ok: true, zone });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Update parking zone
+  const zoneMatch = url.pathname.match(/^\/api\/zones\/([A-Za-z0-9_-]+)$/);
+  if (req.method === 'PUT' && zoneMatch) {
+    try {
+      const zoneId = zoneMatch[1];
+      const body = JSON.parse(await readBody(req));
+      const zone = await updateZone(zoneId, body || {});
+      return json(res, 200, { ok: true, zone });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Delete parking zone
+  if (req.method === 'DELETE' && zoneMatch) {
+    try {
+      const zoneId = zoneMatch[1];
+      const zone = await deleteZone(zoneId);
+      return json(res, 200, { ok: true, zone });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Get all active sessions for monitoring
+  if (req.method === 'GET' && url.pathname === '/api/admin/sessions') {
+    try {
+      const sessions = await getAllSessions();
+      return json(res, 200, { ok: true, sessions });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: Emergency gate override
+  if (req.method === 'POST' && url.pathname === '/api/admin/override') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const result = await adminOverrideGate(body || {});
+      return json(res, 200, result);
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Create booking
+  if (req.method === 'POST' && url.pathname === '/api/bookings') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const session = await createBooking(body || {});
+      return json(res, 201, { ok: true, session });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Get session details
+  const sessionMatch = url.pathname.match(/^\/api\/sessions\/([A-Za-z0-9_-]+)$/);
+  if (req.method === 'GET' && sessionMatch) {
+    try {
+      const sessionCode = sessionMatch[1];
+      const session = await getSession(sessionCode);
+      if (!session) return json(res, 404, { ok: false, error: 'Sesi parkir tidak ditemukan' });
+      return json(res, 200, { ok: true, session });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Gate In: Scan session QR + VLM plate reading
+  if (req.method === 'POST' && url.pathname === '/api/gates/entry') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      let plateRead = null;
+      let vlmError = null;
+
+      // Run VLM if image provided and no manual override
+      if (body.platePhotoBase64 && !body.manualPlateOverride) {
+        const vlmRes = await readPlate({
+          imageBase64: body.platePhotoBase64,
+          mimeType: body.mimeType || 'image/jpeg',
+          context: 'entry',
+        });
+        if (vlmRes.ok) {
+          plateRead = vlmRes.result;
+        } else {
+          vlmError = vlmRes.error;
+        }
+      }
+
+      const result = await processGateIn({
+        sessionCode: body.sessionCode,
+        plateRead,
+        manualPlateOverride: body.manualPlateOverride,
+      });
+
+      return json(res, 200, { ok: true, ...result, vlmError });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Zone QR scan: confirm parking or initiate checkout
+  if (req.method === 'POST' && url.pathname === '/api/zones/scan') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const session = await processZoneScan(body || {});
+      return json(res, 200, { ok: true, session });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // In-app Payment (QRIS / mock)
+  if (req.method === 'POST' && url.pathname === '/api/payments/pay') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const session = await processPayment(body || {});
+      return json(res, 200, { ok: true, session });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Gate Out: Scan exit QR + VLM plate verification
+  if (req.method === 'POST' && url.pathname === '/api/gates/exit') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      let plateRead = null;
+      let vlmError = null;
+
+      // Run VLM if image provided and no manual override
+      if (body.platePhotoBase64 && !body.manualPlateOverride) {
+        const vlmRes = await readPlate({
+          imageBase64: body.platePhotoBase64,
+          mimeType: body.mimeType || 'image/jpeg',
+          context: 'exit',
+        });
+        if (vlmRes.ok) {
+          plateRead = vlmRes.result;
+        } else {
+          vlmError = vlmRes.error;
+        }
+      }
+
+      const result = await processGateOut({
+        exitCode: body.exitCode,
+        plateRead,
+        manualPlateOverride: body.manualPlateOverride,
+      });
+
+      return json(res, 200, { ok: true, ...result, vlmError });
+    } catch (err) {
+      return json(res, 400, { ok: false, error: err?.message || String(err) });
+    }
   }
 
   return json(res, 404, { ok: false, error: 'Not found' });
 });
 
+// Initialize master data on startup
+initMasterData().catch(console.error);
+
 server.listen(PORT, HOST, () => {
-  console.log(`smart-parking listening on http://${HOST}:${PORT} (static=${STATIC_DIR}, model=${OPENROUTER_MODEL}, key=${OPENROUTER_API_KEY ? 'set' : 'MISSING'})`);
+  console.log(`Smart Parking server listening on http://${HOST}:${PORT} (model=${OPENROUTER_MODEL}, Redis=connected)`);
 });

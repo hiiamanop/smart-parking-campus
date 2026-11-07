@@ -1,0 +1,453 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import jsQR from 'jsqr';
+
+type PipelineStep = '1_SCANNING_QR' | '2_READING_PLATE_VLM' | '3_SAVING_OPENING' | '4_GATE_OPENED';
+
+export function App() {
+  const [gateMode, setGateMode] = useState<'entry' | 'exit'>('entry');
+  const [currentStep, setCurrentStep] = useState<PipelineStep>('1_SCANNING_QR');
+
+  // Camera & Stream refs
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+
+  // Automated workflow state
+  const [detectedQrCode, setDetectedQrCode] = useState<string | null>(null);
+  const [vlmPlate, setVlmPlate] = useState<string | null>(null);
+  const [gateOpen, setGateOpen] = useState(false);
+  const [statusText, setStatusText] = useState('Arahkan QR Tiket ke Kamera Gate...');
+  const [errorText, setErrorText] = useState<string | null>(null);
+
+  // Snapshot image when plate is captured
+  const [snapshotDataUrl, setSnapshotDataUrl] = useState<string | null>(null);
+
+  // Ref to prevent multiple concurrent triggers
+  const isProcessingRef = useRef(false);
+
+  // Initialize and start live camera on mount or mode change
+  const startCamera = useCallback(async () => {
+    try {
+      setCameraError(null);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      });
+
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        setCameraActive(true);
+      }
+    } catch (err: any) {
+      console.warn('Webcam stream error', err);
+      setCameraError('Kamera tidak dapat diakses langsung. Anda dapat menggunakan fitur upload foto atau mengizinkan akses kamera browser.');
+      setCameraActive(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    startCamera();
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    };
+  }, [startCamera]);
+
+  // Clean code extraction helper (handles e.g. "SP-A1B2", "#SP-A1B2", "OUT-7C1D", JSON, URL)
+  const extractCode = (raw: string): string => {
+    if (!raw) return '';
+    const clean = raw.trim().replace(/^#/, '');
+    const m = clean.match(/(SP-[A-Z0-9]+|OUT-[A-Z0-9]+)/i);
+    if (m) return m[1].toUpperCase();
+    return clean.toUpperCase();
+  };
+
+  // Pipeline Step 3: Call Backend to Save Plate & Open Gate
+  const savePlateAndOpenGate = async (code: string, plateText: string) => {
+    setCurrentStep('3_SAVING_OPENING');
+    setStatusText(`Menyimpan plat ${plateText} ke sesi...`);
+    setErrorText(null);
+
+    try {
+      if (gateMode === 'entry') {
+        const res = await fetch('/api/gates/entry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionCode: code,
+            manualPlateOverride: plateText,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal menyimpan plat ke gate masuk');
+
+        // Success: Plat is saved, Open gate!
+        setGateOpen(true);
+        setCurrentStep('4_GATE_OPENED');
+        setStatusText(`PLAT ${data.session.plate} TERSIMPAN! PALANG GATE MASUK TERBUKA.`);
+      } else {
+        // Exit Gate
+        const res = await fetch('/api/gates/exit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            exitCode: code,
+            manualPlateOverride: plateText,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Gate keluar ditolak');
+
+        setGateOpen(true);
+        setCurrentStep('4_GATE_OPENED');
+        setStatusText(`VERIFIKASI PLAT COCOK (${plateText})! PALANG GATE KELUAR TERBUKA.`);
+      }
+
+      // Auto-reset after 7 seconds for next vehicle
+      setTimeout(() => {
+        resetPipeline();
+      }, 7000);
+    } catch (err: any) {
+      setErrorText(err.message || String(err));
+      // Return to scanning step after 3 seconds
+      setTimeout(() => {
+        isProcessingRef.current = false;
+        setCurrentStep('1_SCANNING_QR');
+        setStatusText('Arahkan QR Tiket ke Kamera Gate...');
+      }, 3000);
+    }
+  };
+
+  // Pipeline Step 2: Automatic Snapshot & AI VLM Plate Recognition (Sequential, 0 clicks)
+  const processVlmPlateCapture = async (code: string, snapshotBase64: string) => {
+    setCurrentStep('2_READING_PLATE_VLM');
+    setStatusText('QR Terverifikasi! Kamera AI VLM sedang membaca plat nomor...');
+    setErrorText(null);
+
+    try {
+      const m = snapshotBase64.match(/^data:(.*?);base64,(.*)$/);
+      const mimeType = m?.[1] || 'image/jpeg';
+      const imageBase64 = m?.[2] || snapshotBase64;
+
+      const res = await fetch('/api/vlm/plate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64, mimeType, context: gateMode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'AI VLM gagal membaca gambar');
+
+      const plate = data.result?.plate;
+      if (!plate) {
+        throw new Error('Plat nomor tidak terbaca oleh AI VLM. Pastikan plat berada di depan kamera.');
+      }
+
+      setVlmPlate(plate);
+      // Immediately proceed to save and open barrier!
+      await savePlateAndOpenGate(code, plate);
+    } catch (err: any) {
+      setErrorText(err.message || String(err));
+      // If VLM fails, reset after 3 seconds so driver can realign plate
+      setTimeout(() => {
+        isProcessingRef.current = false;
+        setCurrentStep('1_SCANNING_QR');
+        setStatusText('Arahkan QR Tiket ke Kamera Gate...');
+      }, 3500);
+    }
+  };
+
+  // Pipeline Step 1: Triggered automatically when jsQR finds a QR code
+  const onQrCodeDetected = async (rawCode: string) => {
+    if (isProcessingRef.current) return;
+    isProcessingRef.current = true;
+
+    const clean = extractCode(rawCode);
+    setDetectedQrCode(clean);
+    setStatusText(`QR Terdeteksi: ${clean}. Mengambil snapshot kamera untuk AI VLM...`);
+
+    // Capture current live frame from video
+    let snapshot = '';
+    if (videoRef.current && canvasRef.current) {
+      const v = videoRef.current;
+      const c = canvasRef.current;
+      c.width = v.videoWidth || 640;
+      c.height = v.videoHeight || 480;
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(v, 0, 0, c.width, c.height);
+        snapshot = c.toDataURL('image/jpeg', 0.85);
+        setSnapshotDataUrl(snapshot);
+      }
+    }
+
+    // Immediately call VLM sequentially!
+    await processVlmPlateCapture(clean, snapshot);
+  };
+
+  // Continuous Camera Scanning Loop for QR code
+  useEffect(() => {
+    let animId: number;
+
+    const scanFrame = () => {
+      if (
+        !isProcessingRef.current &&
+        videoRef.current &&
+        videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA &&
+        canvasRef.current
+      ) {
+        const video = videoRef.current;
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+        if (ctx) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const qr = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'dontInvert',
+          });
+
+          if (qr && qr.data && qr.data.trim()) {
+            onQrCodeDetected(qr.data);
+          }
+        }
+      }
+
+      animId = requestAnimationFrame(scanFrame);
+    };
+
+    animId = requestAnimationFrame(scanFrame);
+    return () => cancelAnimationFrame(animId);
+  }, []);
+
+  // Reset entire pipeline
+  const resetPipeline = () => {
+    isProcessingRef.current = false;
+    setDetectedQrCode(null);
+    setVlmPlate(null);
+    setSnapshotDataUrl(null);
+    setGateOpen(false);
+    setErrorText(null);
+    setCurrentStep('1_SCANNING_QR');
+    setStatusText('Arahkan QR Tiket ke Kamera Gate...');
+  };
+
+  // Manual fallback snapshot file upload (if no webcam available)
+  const handleManualUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const dataUrl = String(r.result || '');
+      setSnapshotDataUrl(dataUrl);
+
+      // Scan QR from image file
+      const img = new Image();
+      img.onload = () => {
+        if (!canvasRef.current) return;
+        const c = canvasRef.current;
+        c.width = img.width;
+        c.height = img.height;
+        const ctx = c.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0);
+          const imgData = ctx.getImageData(0, 0, c.width, c.height);
+          const qr = jsQR(imgData.data, imgData.width, imgData.height);
+          if (qr && qr.data) {
+            onQrCodeDetected(qr.data);
+          } else {
+            setErrorText('QR Code tidak ditemukan di foto. Pastikan QR terlihat jelas.');
+          }
+        }
+      };
+      img.src = dataUrl;
+    };
+    r.readAsDataURL(file);
+  };
+
+  return (
+    <div className="kiosk-app-frame">
+      {/* Hidden processing canvas */}
+      <canvas ref={canvasRef} style={{ display: 'none' }} />
+
+      {/* Header */}
+      <header className="kiosk-navbar">
+        <div className="kiosk-headline">
+          <span>📹</span>
+          <span>Terminal Kiosk Gate &amp; AI Scanner</span>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div className="kiosk-pill-live">
+            <span className="pulse-circle-green" />
+            <span>Kamera &amp; VLM Aktif</span>
+          </div>
+
+          <div className="mode-toggle-group">
+            <button
+              type="button"
+              className={`mode-toggle-btn ${gateMode === 'entry' ? 'active' : ''}`}
+              onClick={() => {
+                setGateMode('entry');
+                resetPipeline();
+              }}
+            >
+              Gate Masuk
+            </button>
+            <button
+              type="button"
+              className={`mode-toggle-btn ${gateMode === 'exit' ? 'active' : ''}`}
+              onClick={() => {
+                setGateMode('exit');
+                resetPipeline();
+              }}
+            >
+              Gate Keluar
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Big Gate Barrier Banner */}
+      <div className={`gate-barrier-banner ${gateOpen ? 'open' : 'closed'}`}>
+        <div>
+          <span>PALANG {gateMode === 'entry' ? 'MASUK' : 'KELUAR'}: </span>
+          <span style={{ fontSize: '1.4rem' }}>{gateOpen ? '🟢 TERBUKA' : '🔴 TERTUTUP'}</span>
+        </div>
+        <div style={{ fontSize: 13, opacity: 0.9 }}>
+          {gateOpen ? 'Kendaraan Silakan Lewat' : 'Menunggu Validasi Berurutan (QR → Plat AI)'}
+        </div>
+      </div>
+
+      {/* Sequential Pipeline Stepper */}
+      <div className="pipeline-stepper">
+        <div className={`pipeline-step ${currentStep === '1_SCANNING_QR' ? 'active' : 'completed'}`}>
+          <div className="pipeline-step-num">Tahap 1 (Otomatis)</div>
+          <div className="pipeline-step-title">
+            {detectedQrCode ? `✓ QR: ${detectedQrCode}` : '1. Pindai QR Tiket'}
+          </div>
+        </div>
+
+        <div className={`pipeline-step ${currentStep === '2_READING_PLATE_VLM' ? 'active' : currentStep === '3_SAVING_OPENING' || currentStep === '4_GATE_OPENED' ? 'completed' : ''}`}>
+          <div className="pipeline-step-num">Tahap 2 (Otomatis)</div>
+          <div className="pipeline-step-title">
+            {vlmPlate ? `✓ Plat: ${vlmPlate}` : '2. AI VLM Baca Plat'}
+          </div>
+        </div>
+
+        <div className={`pipeline-step ${currentStep === '3_SAVING_OPENING' ? 'active' : currentStep === '4_GATE_OPENED' ? 'completed' : ''}`}>
+          <div className="pipeline-step-num">Tahap 3 (Otomatis)</div>
+          <div className="pipeline-step-title">
+            {gateOpen ? '✓ Plat Tersimpan & Gate Buka' : '3. Kunci Plat & Buka'}
+          </div>
+        </div>
+      </div>
+
+      {errorText && (
+        <div className="alert-terminal err">
+          <strong>Perhatian: </strong>{errorText}
+        </div>
+      )}
+
+      {/* Main Live Camera Stream Frame */}
+      <div className="camera-stream-wrapper">
+        {/* Live video element */}
+        <video
+          ref={videoRef}
+          className="camera-video-feed"
+          autoPlay
+          playsInline
+          muted
+          style={{ display: snapshotDataUrl && currentStep !== '1_SCANNING_QR' ? 'none' : 'block' }}
+        />
+
+        {/* Snapshot review if frozen for VLM */}
+        {snapshotDataUrl && currentStep !== '1_SCANNING_QR' && (
+          <img src={snapshotDataUrl} alt="Snapshot Kamera" className="camera-snapshot-img" />
+        )}
+
+        {/* Dynamic Scanning Reticle Overlay */}
+        <div className={`scanning-reticle-box ${detectedQrCode ? 'qr-detected' : ''}`}>
+          <div className="reticle-instruction-text">
+            {currentStep === '1_SCANNING_QR'
+              ? 'ARAHKAN QR TIKET KE SINI'
+              : currentStep === '2_READING_PLATE_VLM'
+              ? '📸 AI VLM SEDANG MEMBACA PLAT...'
+              : 'VERIFIKASI & MEMBUKA PALANG...'}
+          </div>
+
+          {currentStep === '1_SCANNING_QR' && <div className="laser-beam" />}
+
+          <div style={{ fontSize: 11, color: '#a5b4fc', fontWeight: 700 }}>
+            {gateMode === 'entry' ? 'GATE MASUK KAMPUS' : 'GATE KELUAR KAMPUS'}
+          </div>
+        </div>
+
+        {/* Floating Status Bar Overlay */}
+        <div className="camera-floating-status">
+          <div>
+            <div className="status-lead-text">{statusText}</div>
+            <div className="status-sub-text">
+              Proses berjalan sekuensial otomatis tanpa klik
+            </div>
+          </div>
+
+          {vlmPlate && (
+            <div className="plate-detected-pill">
+              {vlmPlate}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Bottom Controls / Fallback options */}
+      <div className="bottom-controls-card">
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button
+            type="button"
+            className="btn-kiosk-action sec"
+            onClick={resetPipeline}
+          >
+            🔄 Reset Scanner
+          </button>
+
+          <button
+            type="button"
+            className="btn-kiosk-action sec"
+            onClick={startCamera}
+          >
+            📹 Restart Kamera
+          </button>
+        </div>
+
+        <div>
+          <label>
+            <span className="btn-kiosk-action sec" style={{ cursor: 'pointer' }}>
+              📁 Unggah Foto (Jika Tanpa Webcam)
+            </span>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={handleManualUpload}
+              style={{ display: 'none' }}
+            />
+          </label>
+        </div>
+      </div>
+    </div>
+  );
+}

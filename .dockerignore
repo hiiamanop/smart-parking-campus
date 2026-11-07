@@ -7,3 +7,5 @@ docs
 Dockerfile
 docker-compose.yml
 README.md
+client/src
+gate/src
