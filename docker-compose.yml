@@ -1,24 +1,82 @@
 services:
-  web:
+  redis:
+    image: redis:alpine
+    container_name: smart-parking-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - supabase
+
+  api:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: smart-parking-web:latest
-    container_name: smart-parking-web
+      dockerfile: deploy/api.Dockerfile
+    image: smart-parking-api:latest
+    container_name: smart-parking-api
     restart: unless-stopped
     env_file:
       - .env
     environment:
       VLM_PROXY_HOST: 0.0.0.0
       VLM_PROXY_PORT: 8788
-      STATIC_DIR: /app/app/dist
-      # Nama service Supabase di network supabase_default (tanpa lewat Cloudflare/CORS).
-      SUPABASE_URL: http://api-gw:8000
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - redis
     ports:
-      # Hanya untuk akses lokal/tes. Publik lewat Cloudflare Tunnel.
+      # Hanya untuk tes lokal. Publik lewat Cloudflare Tunnel.
       - "127.0.0.1:8788:8788"
     networks:
       - supabase
+
+  driver:
+    build:
+      context: .
+      dockerfile: deploy/web.Dockerfile
+    image: smart-parking-web:latest
+    container_name: smart-parking-driver
+    restart: unless-stopped
+    environment:
+      APP_DIR: /app/dist/client
+      API_TARGET: http://api:8788
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:8081:8080"
+    networks:
+      - supabase
+
+  admin:
+    image: smart-parking-web:latest
+    container_name: smart-parking-admin
+    restart: unless-stopped
+    environment:
+      APP_DIR: /app/dist/admin
+      API_TARGET: http://api:8788
+    depends_on:
+      - driver
+    ports:
+      - "127.0.0.1:8082:8080"
+    networks:
+      - supabase
+
+  gate:
+    image: smart-parking-web:latest
+    container_name: smart-parking-gate
+    restart: unless-stopped
+    environment:
+      APP_DIR: /app/dist/gate
+      API_TARGET: http://api:8788
+    depends_on:
+      - driver
+    ports:
+      - "127.0.0.1:8083:8080"
+    networks:
+      - supabase
+
+volumes:
+  redis-data:
 
 networks:
   supabase:

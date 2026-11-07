@@ -1,0 +1,16 @@
+{
+  "name": "Smart Parking Kampus - Gate Kiosk",
+  "short_name": "SP Gate",
+  "description": "Terminal gate kiosk: scan QR, baca plat (VLM), buka palang.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "fullscreen",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "lang": "id",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

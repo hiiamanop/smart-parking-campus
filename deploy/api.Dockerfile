@@ -2,14 +2,14 @@ FROM node:22-alpine
 
 WORKDIR /app
 
+COPY server/package.json server/package-lock.json ./server/
+RUN cd server && npm ci --omit=dev
+
+COPY server ./server
+
 ENV NODE_ENV=production \
     VLM_PROXY_HOST=0.0.0.0 \
-    VLM_PROXY_PORT=8788 \
-    STATIC_DIR=/app/app/dist
-
-COPY server/package.json ./server/package.json
-COPY server/server.mjs ./server/server.mjs
-COPY app/dist ./app/dist
+    VLM_PROXY_PORT=8788
 
 EXPOSE 8788
 

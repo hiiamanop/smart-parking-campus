@@ -1,14 +1,18 @@
 {
   "name": "smart-parking-kampus",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Smart Parking Kampus - booking, QR gate, VLM plat, PWA.",
+  "description": "Smart Parking Kampus - driver app, admin dashboard, gate kiosk, VLM.",
   "scripts": {
-    "build": "npm --prefix app run build",
-    "dev": "npm --prefix app run dev",
-    "dev:server": "node server/server.mjs",
-    "icons": "node app/scripts/make-icons.mjs",
-    "db:apply": "docker exec -i supabase-db psql -U postgres -d postgres < supabase/schema.sql",
+    "build": "npm --prefix app run build && npm --prefix client run build && npm --prefix gate run build",
+    "build:admin": "npm --prefix app run build",
+    "build:client": "npm --prefix client run build",
+    "build:gate": "npm --prefix gate run build",
+    "dev:server": "npm --prefix server start",
+    "dev:admin": "npm --prefix app run dev",
+    "dev:client": "npm --prefix client run dev",
+    "dev:gate": "npm --prefix gate run dev",
+    "test:server": "npm --prefix server test",
     "deploy": "npm run build && docker compose up -d --build"
   }
 }
