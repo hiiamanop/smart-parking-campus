@@ -173,6 +173,150 @@ Jika plat tidak terbaca, isi plate dengan null dan jelaskan di notes.`;
   };
 }
 
+/* ------------------------- Operator assistant ------------------------- */
+
+const ASSISTANT_TIMEOUT_MS = Number(process.env.ASSISTANT_TIMEOUT_MS || 30000);
+const ASSISTANT_ACTION_TYPES = new Set([
+  'create_domain',
+  'update_domain',
+  'delete_domain',
+  'create_zone',
+  'update_zone',
+  'delete_zone',
+  'cancel_booking',
+  'reissue_exit',
+]);
+
+const ASSISTANT_PROMPT = `Anda adalah asisten operator untuk dashboard Smart Parking Kampus (Indonesia).
+Tugas: membantu operator membaca data parkir dan menyiapkan perubahan data.
+
+ATURAN:
+- Gunakan HANYA data dan ID pada "DATA SAAT INI". Jangan mengarang ID.
+- Jika permintaan kurang jelas atau ID tidak ditemukan, tanyakan balik di "reply" dan jangan buat action.
+- Jangan mengklaim sudah mengubah data. Perubahan hanya diusulkan lewat "action" dan dieksekusi setelah operator menyetujui.
+- Hapus domain/zona hanya bila operator memintanya dengan jelas.
+- Jawab ringkas dalam bahasa Indonesia.
+- Balas dalam teks biasa, bukan Markdown: jangan pakai **, #, atau tabel. Untuk daftar gunakan baris diawali "- ".
+
+Balas HANYA JSON valid tanpa markdown, salah satu bentuk:
+{"reply":"jawaban untuk operator","action":null}
+{"reply":"ringkasan perubahan yang akan dilakukan","action":{"type":"<tipe>","params":{...}}}
+
+Tipe action dan params:
+- create_domain: {name, description?}
+- update_domain: {id, name?, description?}
+- delete_domain: {id}
+- create_zone: {name, domainId, vehicleType: "car"|"motorcycle", capacity, gateIn?, gateOut?}
+- update_zone: {id, name?, domainId?, vehicleType?, capacity?, gateIn?, gateOut?}
+- delete_zone: {id}
+- cancel_booking: {sessionCode}
+- reissue_exit: {sessionCode} (terbitkan ulang QR keluar; denda Rp20.000 bila QR lama kedaluwarsa)`;
+
+async function assistantSnapshot() {
+  const { domains, zones } = await getZonesWithOccupancy();
+  const sessions = await getAllSessions();
+  const today = new Date().toISOString().slice(0, 10);
+  const analytics = await getAnalytics({ from: today, to: today });
+  return {
+    domains: domains.map((d) => ({ id: d.id, name: d.name, description: d.description || '' })),
+    zones: zones.map((z) => ({
+      id: z.id,
+      name: z.name,
+      domainId: z.domainId,
+      vehicleType: z.vehicleType,
+      capacity: z.capacity,
+      occupied: z.occupied,
+      available: z.available,
+      gateIn: z.gateIn,
+      gateOut: z.gateOut,
+    })),
+    activeSessions: sessions.slice(0, 50).map((s) => ({
+      sessionCode: s.sessionCode,
+      plate: s.displayPlate || s.plate,
+      userName: s.userName,
+      zoneId: s.zoneId,
+      status: s.status,
+      createdAt: s.createdAt,
+      penaltyTotal: s.penaltyTotal || 0,
+    })),
+    today: {
+      totals: analytics.totals,
+      finance: {
+        totalRevenue: analytics.finance.totalRevenue,
+        penaltyRevenue: analytics.finance.penaltyRevenue,
+        totalPayments: analytics.finance.totalPayments,
+        byVehicle: analytics.finance.byVehicle,
+      },
+      peakHours: analytics.peakHours,
+      zones: analytics.zones.map((z) => ({
+        zoneId: z.zoneId,
+        zoneName: z.zoneName,
+        occupied: z.occupied,
+        capacity: z.capacity,
+        revenue: z.revenue,
+        activity: z.activity,
+        priority: z.priority,
+      })),
+    },
+  };
+}
+
+async function askOperatorAssistant(messages) {
+  if (!OPENROUTER_API_KEY) {
+    return { ok: false, error: 'OPENROUTER_API_KEY belum diisi di .env' };
+  }
+
+  const snapshot = await assistantSnapshot();
+  metrics.vlmCalls += 1;
+  const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+    signal: AbortSignal.timeout(ASSISTANT_TIMEOUT_MS),
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': SITE_URL,
+      'X-Title': APP_NAME,
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: ASSISTANT_PROMPT },
+        { role: 'system', content: `DATA SAAT INI (JSON):\n${JSON.stringify(snapshot)}` },
+        ...messages,
+      ],
+    }),
+  });
+
+  const raw = await response.text();
+  let payload;
+  try { payload = JSON.parse(raw); } catch { payload = { raw }; }
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: response.status,
+      error: payload?.error?.message || payload?.message || 'OpenRouter error',
+    };
+  }
+
+  const text = payload?.choices?.[0]?.message?.content;
+  const content = Array.isArray(text) ? text.map((p) => p?.text || '').join('\n') : (text || '');
+  const parsed = extractJsonObject(content) || {};
+  const proposed = parsed.action;
+  const action =
+    proposed && typeof proposed === 'object' && ASSISTANT_ACTION_TYPES.has(proposed.type)
+      ? { type: proposed.type, params: proposed.params && typeof proposed.params === 'object' ? proposed.params : {} }
+      : null;
+
+  return {
+    ok: true,
+    model: OPENROUTER_MODEL,
+    reply: typeof parsed.reply === 'string' ? parsed.reply : content || 'Tidak ada jawaban dari model.',
+    action,
+    usage: payload?.usage || null,
+  };
+}
+
 // SSE Connection Management hooked to Redis Pub/Sub
 const sseClients = new Set();
 
@@ -475,6 +619,28 @@ const server = http.createServer(async (req, res) => {
       const events = await getEventHistory({ date, from, to, limit });
       return json(res, 200, { ok: true, events });
     } catch (err) {
+      return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: operator assistant (LLM; proposes actions, never executes them)
+  if (req.method === 'POST' && url.pathname === '/api/admin/assistant') {
+    try {
+      const body = JSON.parse((await readBody(req, 64 * 1024)) || '{}');
+      const messages = Array.isArray(body.messages)
+        ? body.messages
+            .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+            .slice(-12)
+            .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }))
+        : [];
+      if (messages.length === 0) {
+        return json(res, 400, { ok: false, error: 'messages wajib diisi' });
+      }
+      const result = await askOperatorAssistant(messages);
+      return json(res, result.ok ? 200 : 502, result);
+    } catch (err) {
+      metrics.errors += 1;
+      log('error', 'assistant_failed', { error: err?.message || String(err) });
       return json(res, 500, { ok: false, error: err?.message || String(err) });
     }
   }

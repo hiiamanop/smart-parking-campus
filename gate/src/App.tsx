@@ -711,7 +711,7 @@ export function App() {
             resetPipeline();
           }}
         >
-          <img src="/logo-itb.png" alt="Logo ITB" className="kiosk-logo" />
+          <img src="/lencana-parkir-pintar.png" alt="Parkir Pintar ITB" className="kiosk-logo" />
           <h1>Token perangkat gate</h1>
           <p className="hint-text">Masukkan token gate yang dikonfigurasi di server untuk mengaktifkan terminal ini.</p>
           <input
@@ -735,7 +735,7 @@ export function App() {
       {/* Header */}
       <header className="kiosk-navbar">
         <div className="kiosk-headline">
-          <img className="kiosk-logo" src="/logo-itb.png" alt="Logo ITB" />
+          <img className="kiosk-logo" src="/lencana-parkir-pintar.png" alt="Parkir Pintar ITB" />
           <span>Terminal Kiosk Gate &amp; AI Scanner</span>
         </div>
 
