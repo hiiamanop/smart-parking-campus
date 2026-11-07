@@ -16,12 +16,17 @@ export function App() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraDiag, setCameraDiag] = useState<{ secure: boolean; mediaDevices: boolean; permission: string }>({ secure: true, mediaDevices: true, permission: 'unknown' });
 
+  // SSE live state
+  const [redisLive, setRedisLive] = useState(false);
+  const [liveEvent, setLiveEvent] = useState<string>('Menunggu event...');
+
   // On-device plate detector (ONNX) state
   const [detectorReady, setDetectorReady] = useState(false);
   const [detectorLoading, setDetectorLoading] = useState(false);
   const [detectorError, setDetectorError] = useState<string | null>(null);
   const detectorSessionRef = useRef<any>(null);
   const consecutiveDetectRef = useRef(0);
+  const resetPipelineRef = useRef<() => void>(() => {});
 
   // OCR lokal (recognizer) state
   const [recognizerReady, setRecognizerReady] = useState(false);
@@ -335,6 +340,24 @@ export function App() {
     };
   }, [startCamera]);
 
+  // Live Redis Pub/Sub SSE (gate terminal)
+  useEffect(() => {
+    const sse = new EventSource('/api/events');
+    sse.onopen = () => setRedisLive(true);
+    sse.onerror = () => setRedisLive(false);
+    sse.onmessage = (e) => {
+      try {
+        const ev = JSON.parse(e.data);
+        setLiveEvent(`${ev.type}${ev.payload?.sessionCode ? ' · ' + ev.payload.sessionCode : ''}`);
+        if (ev.type === 'GATE_EXIT_SUCCESS') {
+          // Siapkan gate untuk kendaraan berikutnya setelah jeda singkat
+          setTimeout(() => resetPipelineRef.current(), 4000);
+        }
+      } catch {}
+    };
+    return () => sse.close();
+  }, []);
+
   // Muat model deteksi plat (ONNX) di background
   useEffect(() => {
     let cancelled = false;
@@ -535,6 +558,10 @@ export function App() {
     setStatusText('Arahkan QR Tiket ke Kamera Gate...');
   };
 
+  useEffect(() => {
+    resetPipelineRef.current = resetPipeline;
+  }, [resetPipeline]);
+
   // Manual fallback snapshot file upload (if no webcam available)
   const handleManualUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -584,6 +611,11 @@ export function App() {
           <div className={`kiosk-pill-live ${cameraActive ? '' : 'offline'}`}>
             <span className={cameraActive ? 'pulse-circle-green' : 'pulse-circle-red'} />
             <span>{cameraActive ? 'Kamera & VLM Aktif' : 'Kamera Nonaktif — Pakai Upload Foto'}</span>
+          </div>
+
+          <div className={`kiosk-pill-live ${redisLive ? '' : 'offline'}`} style={{ background: redisLive ? '#0c1e3a' : '#1e293b', borderColor: redisLive ? '#3b82f6' : '#475569', color: redisLive ? '#93c5fd' : '#94a3b8' }}>
+            <span className={redisLive ? 'pulse-circle-green' : 'pulse-circle-red'} style={{ background: redisLive ? '#3b82f6' : '#64748b' }} />
+            <span>{redisLive ? 'Redis Live' : 'Redis Offline'}</span>
           </div>
 
           <div className="mode-toggle-group">

@@ -603,3 +603,23 @@ html, body {
 }
 .alert-message.ok { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
 .alert-message.err { background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+
+.exit-notice-toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  background: #065f46;
+  color: #fff;
+  padding: 12px 18px;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  animation: slideDown 0.3s ease;
+}
+@keyframes slideDown {
+  from { transform: translate(-50%, -120%); opacity: 0; }
+  to { transform: translate(-50%, 0); opacity: 1; }
+}

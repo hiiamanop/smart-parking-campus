@@ -48,6 +48,7 @@ export function App() {
   const [faculties, setFaculties] = useState<Faculty[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
   const [redisLive, setRedisLive] = useState(false);
+  const [exitNotice, setExitNotice] = useState<string | null>(null);
 
   // Active Parking Session in localStorage
   const [activeSession, setActiveSession] = useState<ParkingSession | null>(() => {
@@ -97,14 +98,19 @@ export function App() {
         // Live sync active session whenever gate or zone action occurs
         if (activeSession && (event.payload?.sessionCode === activeSession.sessionCode || event.type === 'GATE_EXIT_SUCCESS')) {
           if (event.type === 'GATE_EXIT_SUCCESS' && event.payload?.sessionCode === activeSession.sessionCode) {
-            updateSession(null);
+            setExitNotice('Kendaraan berhasil keluar. Palang gate terbuka, tiket dihapus.');
+            setTimeout(() => { updateSession(null); setExitNotice(null); }, 2500);
           } else {
             fetch(`/api/sessions/${activeSession.sessionCode}`)
               .then((r) => r.json())
               .then((res) => {
                 if (res.ok && res.session) {
-                  if (res.session.status === 'COMPLETED') updateSession(null);
-                  else updateSession(res.session);
+                  if (res.session.status === 'COMPLETED') {
+                    setExitNotice('Kendaraan berhasil keluar. Palang gate terbuka, tiket dihapus.');
+                    setTimeout(() => { updateSession(null); setExitNotice(null); }, 2500);
+                  } else {
+                    updateSession(res.session);
+                  }
                 }
               });
           }
@@ -139,6 +145,11 @@ export function App() {
         </div>
       </header>
 
+      {exitNotice && (
+        <div className="exit-notice-toast">
+          ✅ {exitNotice}
+        </div>
+      )}
       {/* Main Mobile Content Area */}
       <div className="mobile-content">
         {activeTab === 'parking' ? (
