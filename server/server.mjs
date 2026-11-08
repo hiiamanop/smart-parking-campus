@@ -161,8 +161,9 @@ async function resolveVllmModel() {
   } catch {
     // vLLM not reachable yet; fall through to the configured name.
   }
-  resolvedVllmModel = VLLM_MODEL || 'gemma-4-12b';
-  return resolvedVllmModel;
+  // Do not cache the fallback: once vLLM is up, the next call retries
+  // /v1/models and can auto-discover the real served model name.
+  return VLLM_MODEL || 'gemma-4-12b';
 }
 
 async function readPlate({ imageUrl, imageBase64, mimeType = 'image/jpeg', context = 'entry' }) {
