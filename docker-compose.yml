@@ -22,8 +22,11 @@ services:
       VLM_PROXY_HOST: 0.0.0.0
       VLM_PROXY_PORT: 8788
       REDIS_URL: redis://redis:6379
+      TZ: Asia/Jakarta
     depends_on:
       - redis
+    volumes:
+      - history-data:/app/data/history
     ports:
       # Hanya untuk tes lokal. Publik lewat Cloudflare Tunnel.
       - "127.0.0.1:8788:8788"
@@ -77,6 +80,7 @@ services:
 
 volumes:
   redis-data:
+  history-data:
 
 networks:
   supabase:
