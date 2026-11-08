@@ -189,6 +189,53 @@ export async function askAssistant(
   return { reply: data.reply, action: data.action || null };
 }
 
+export interface VoiceSession {
+  voiceSessionId: string;
+  maxSeconds: number;
+  expiresAt: number;
+  sttModel?: string;
+  ttsModel?: string;
+}
+
+export async function startVoiceSession(): Promise<VoiceSession> {
+  const res = await adminFetch('/api/admin/voice/session', { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal memulai sesi suara');
+  return data as VoiceSession;
+}
+
+export interface VoiceTurnResult {
+  transcript: string;
+  reply: string;
+  action: AssistantAction | null;
+  audioBase64: string | null;
+  audioMimeType: string | null;
+  audioError?: string | null;
+}
+
+export async function askVoice(payload: {
+  voiceSessionId: string;
+  audioBase64: string;
+  format?: string;
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+}): Promise<VoiceTurnResult> {
+  const res = await adminFetch('/api/admin/voice', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ format: 'wav', ...payload }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.ok) throw new Error(data.error || 'Sesi suara gagal');
+  return {
+    transcript: data.transcript,
+    reply: data.reply,
+    action: data.action || null,
+    audioBase64: data.audioBase64 || null,
+    audioMimeType: data.audioMimeType || null,
+    audioError: data.audioError || null,
+  };
+}
+
 export function describeAssistantAction(action: AssistantAction): string {
   const p = action.params as Record<string, any>;
   const label: Record<string, string> = {
@@ -199,7 +246,9 @@ export function describeAssistantAction(action: AssistantAction): string {
     update_zone: `Ubah zona ${p.id ?? ''}`,
     delete_zone: `Hapus zona ${p.id ?? ''}`,
     cancel_booking: `Batalkan booking ${p.sessionCode ?? ''}`,
+    cancel_bookings: `Batalkan ${Array.isArray(p.sessionCodes) ? p.sessionCodes.length : 0} booking sekaligus`,
     reissue_exit: `Terbitkan ulang QR keluar untuk ${p.sessionCode ?? ''}`,
+    reissue_exits: `Terbitkan ulang ${Array.isArray(p.sessionCodes) ? p.sessionCodes.length : 0} QR keluar sekaligus`,
   };
   return label[action.type] || action.type;
 }
@@ -255,6 +304,31 @@ export async function applyAssistantAction(action: AssistantAction): Promise<str
       if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal membatalkan booking');
       return `Booking ${p.sessionCode} dibatalkan.`;
     }
+    case 'cancel_bookings': {
+      const codes = Array.isArray(p.sessionCodes)
+        ? p.sessionCodes.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 100)
+        : [];
+      if (!codes.length) throw new Error('Daftar sesi untuk pembatalan kosong');
+      const okCodes: string[] = [];
+      const failed: string[] = [];
+      for (const sessionCode of codes) {
+        try {
+          const res = await adminFetch('/api/bookings/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionCode }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal membatalkan');
+          okCodes.push(sessionCode);
+        } catch (err) {
+          failed.push(`${sessionCode}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return `${okCodes.length}/${codes.length} booking dibatalkan.${
+        failed.length ? ` Gagal: ${failed.join('; ')}` : ''
+      }`;
+    }
     case 'reissue_exit': {
       const res = await adminFetch('/api/payments/reissue', {
         method: 'POST',
@@ -266,6 +340,33 @@ export async function applyAssistantAction(action: AssistantAction): Promise<str
       return data.charged
         ? `QR keluar baru diterbitkan; denda Rp${Number(data.penalty).toLocaleString('id-ID')} dibayar.`
         : 'QR keluar baru diterbitkan tanpa denda.';
+    }
+    case 'reissue_exits': {
+      const codes = Array.isArray(p.sessionCodes)
+        ? p.sessionCodes.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 100)
+        : [];
+      if (!codes.length) throw new Error('Daftar sesi untuk QR keluar kosong');
+      let okCount = 0;
+      let penalty = 0;
+      const failed: string[] = [];
+      for (const sessionCode of codes) {
+        try {
+          const res = await adminFetch('/api/payments/reissue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionCode }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal menerbitkan ulang');
+          okCount += 1;
+          penalty += Number(data.penalty) || 0;
+        } catch (err) {
+          failed.push(`${sessionCode}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return `${okCount}/${codes.length} QR keluar diterbitkan ulang. Total denda Rp${penalty.toLocaleString(
+        'id-ID'
+      )}.${failed.length ? ` Gagal: ${failed.join('; ')}` : ''}`;
     }
     default:
       throw new Error(`Aksi ${action.type} tidak didukung`);

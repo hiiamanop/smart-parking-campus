@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { consensusPlate } from './plateConsensus.mjs';
 import { checkToken, createRateLimiter, clientIp } from './auth.mjs';
@@ -44,6 +45,21 @@ const HOST = process.env.VLM_PROXY_HOST || '127.0.0.1';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const OPENROUTER_BASE_URL = (process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
 const OPENROUTER_MODEL = process.env.OPENROUTER_VLM_MODEL || 'google/gemini-2.5-flash';
+const OPENROUTER_ASSISTANT_MODEL =
+  process.env.OPENROUTER_ASSISTANT_MODEL || 'deepseek/deepseek-v4-flash';
+const OPENROUTER_STT_MODEL = process.env.OPENROUTER_STT_MODEL || 'openai/gpt-audio';
+const OPENROUTER_TTS_MODEL = process.env.OPENROUTER_TTS_MODEL || 'openai/gpt-audio';
+const OPENROUTER_TTS_VOICE = process.env.OPENROUTER_TTS_VOICE || 'nova';
+const VOICE_MAX_SECONDS = Math.max(15, Math.min(600, Number(process.env.VOICE_MAX_SECONDS || 120)));
+const VOICE_MAX_BYTES = Number(process.env.VOICE_MAX_BYTES || 8 * 1024 * 1024);
+
+// Plate VLM provider: "vllm" (local OpenAI-compatible server) or "openrouter".
+const VLM_PROVIDER = (process.env.VLM_PROVIDER || 'openrouter').toLowerCase();
+const VLLM_BASE_URL = (process.env.VLLM_BASE_URL || 'http://host.docker.internal:8001/v1').replace(/\/+$/, '');
+const VLLM_MODEL = process.env.VLLM_MODEL || 'gemma-4-12b';
+const VLLM_API_KEY = process.env.VLLM_API_KEY || '';
+const VLM_TIMEOUT_MS = Number(process.env.VLM_TIMEOUT_MS || (VLM_PROVIDER === 'vllm' ? 90000 : 20000));
+const VLM_MODEL = VLM_PROVIDER === 'vllm' ? VLLM_MODEL : OPENROUTER_MODEL;
 const SITE_URL = process.env.OPENROUTER_SITE_URL || 'http://localhost:5173';
 const APP_NAME = process.env.OPENROUTER_APP_NAME || 'Smart Parking Kampus';
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || '';
@@ -116,8 +132,42 @@ function extractJsonObject(text) {
   return null;
 }
 
+let resolvedVllmModel = '';
+
+function vllmHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  if (VLLM_API_KEY) headers.Authorization = `Bearer ${VLLM_API_KEY}`;
+  return headers;
+}
+
+// Resolve the model served by vLLM. If the configured name is absent, use the
+// first model advertised by /v1/models so a renamed model still works.
+async function resolveVllmModel() {
+  if (resolvedVllmModel) return resolvedVllmModel;
+  try {
+    const res = await fetch(`${VLLM_BASE_URL}/models`, {
+      headers: vllmHeaders(),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const ids = (data?.data || []).map((m) => m?.id).filter(Boolean);
+      if (ids.length) {
+        resolvedVllmModel =
+          !VLLM_MODEL || VLLM_MODEL === 'auto' || !ids.includes(VLLM_MODEL) ? ids[0] : VLLM_MODEL;
+        return resolvedVllmModel;
+      }
+    }
+  } catch {
+    // vLLM not reachable yet; fall through to the configured name.
+  }
+  resolvedVllmModel = VLLM_MODEL || 'gemma-4-12b';
+  return resolvedVllmModel;
+}
+
 async function readPlate({ imageUrl, imageBase64, mimeType = 'image/jpeg', context = 'entry' }) {
-  if (!OPENROUTER_API_KEY) {
+  const isLocal = VLM_PROVIDER === 'vllm';
+  if (!isLocal && !OPENROUTER_API_KEY) {
     return { ok: false, error: 'OPENROUTER_API_KEY belum diisi di .env' };
   }
 
@@ -130,36 +180,64 @@ Balas HANYA JSON valid (tanpa markdown) dengan format:
 {"plate":"B 1234 ABC","confidence":0.0-1.0,"vehicle_type":"car|motorcycle|unknown","raw_text":"teks terbaca","notes":"catatan singkat jika ada"}
 Jika plat tidak terbaca, isi plate dengan null dan jelaskan di notes.`;
 
+  const model = isLocal ? await resolveVllmModel() : OPENROUTER_MODEL;
+  const endpoint = isLocal ? `${VLLM_BASE_URL}/chat/completions` : `${OPENROUTER_BASE_URL}/chat/completions`;
+  const headers = isLocal
+    ? vllmHeaders()
+    : {
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': SITE_URL,
+        'X-Title': APP_NAME,
+      };
+
   metrics.vlmCalls += 1;
-  const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
-    signal: AbortSignal.timeout(Number(process.env.VLM_TIMEOUT_MS || 20000)),
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': SITE_URL,
-      'X-Title': APP_NAME,
-    },
-    body: JSON.stringify({
-      model: OPENROUTER_MODEL,
-      temperature: 0.1,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: dataUrl } },
-          ],
-        },
-      ],
-    }),
-  });
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      signal: AbortSignal.timeout(VLM_TIMEOUT_MS),
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: dataUrl } },
+            ],
+          },
+        ],
+      }),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      provider: isLocal ? 'vllm' : 'openrouter',
+      model,
+      error: isLocal
+        ? `vLLM tidak dapat dihubungi di ${VLLM_BASE_URL}: ${err?.message || String(err)}`
+        : `OpenRouter tidak dapat dihubungi: ${err?.message || String(err)}`,
+    };
+  }
 
   const raw = await response.text();
   let payload;
   try { payload = JSON.parse(raw); } catch { payload = { raw }; }
   if (!response.ok) {
-    return { ok: false, status: response.status, error: payload?.error?.message || payload?.message || 'OpenRouter error', detail: payload };
+    return {
+      ok: false,
+      provider: isLocal ? 'vllm' : 'openrouter',
+      model,
+      status: response.status,
+      error:
+        payload?.error?.message ||
+        payload?.message ||
+        `${isLocal ? 'vLLM' : 'OpenRouter'} error ${response.status}`,
+      detail: payload,
+    };
   }
 
   const text = payload?.choices?.[0]?.message?.content;
@@ -167,7 +245,8 @@ Jika plat tidak terbaca, isi plate dengan null dan jelaskan di notes.`;
   const parsed = extractJsonObject(content);
   return {
     ok: true,
-    model: OPENROUTER_MODEL,
+    provider: isLocal ? 'vllm' : 'openrouter',
+    model,
     result: parsed || { plate: null, confidence: 0, vehicle_type: 'unknown', raw_text: content, notes: 'Respons tidak berbentuk JSON.' },
     usage: payload?.usage || null,
   };
@@ -184,7 +263,9 @@ const ASSISTANT_ACTION_TYPES = new Set([
   'update_zone',
   'delete_zone',
   'cancel_booking',
+  'cancel_bookings',
   'reissue_exit',
+  'reissue_exits',
 ]);
 
 const ASSISTANT_PROMPT = `Anda adalah asisten operator untuk dashboard Smart Parking Kampus (Indonesia).
@@ -210,7 +291,15 @@ Tipe action dan params:
 - update_zone: {id, name?, domainId?, vehicleType?, capacity?, gateIn?, gateOut?}
 - delete_zone: {id}
 - cancel_booking: {sessionCode}
-- reissue_exit: {sessionCode} (terbitkan ulang QR keluar; denda Rp20.000 bila QR lama kedaluwarsa)`;
+- cancel_bookings: {sessionCodes:["SP-...","SP-..."]}  (bulk; hanya sesi status BOOKED)
+- reissue_exit: {sessionCode} (terbitkan ulang QR keluar; denda Rp20.000 bila QR lama kedaluwarsa)
+- reissue_exits: {sessionCodes:["SP-..."]} (bulk)
+
+ATURAN BULK:
+- Jika operator meminta pembatalan beberapa/semua booking sekaligus, gunakan "cancel_bookings" dengan SEMUA sessionCode berstatus BOOKED yang cocok dari DATA SAAT INI. Jangan mengarang kode.
+- Jika operator meminta terbitkan ulang beberapa QR keluar sekaligus, gunakan "reissue_exits" dengan SEMUA sessionCode berstatus PAID yang cocok.
+- Untuk aksi bulk, tulis di "reply" berapa sesi yang akan diproses agar operator bisa memeriksa sebelum menyetujui.
+- Jangan pernah memakai aksi bulk untuk sesi yang statusnya tidak sesuai.`;
 
 async function assistantSnapshot() {
   const { domains, zones } = await getZonesWithOccupancy();
@@ -239,6 +328,10 @@ async function assistantSnapshot() {
       createdAt: s.createdAt,
       penaltyTotal: s.penaltyTotal || 0,
     })),
+    activeSessionCounts: sessions.reduce((acc, s) => {
+      acc[s.status] = (acc[s.status] || 0) + 1;
+      return acc;
+    }, {}),
     today: {
       totals: analytics.totals,
       finance: {
@@ -278,7 +371,7 @@ async function askOperatorAssistant(messages) {
       'X-Title': APP_NAME,
     },
     body: JSON.stringify({
-      model: OPENROUTER_MODEL,
+      model: OPENROUTER_ASSISTANT_MODEL,
       temperature: 0.2,
       messages: [
         { role: 'system', content: ASSISTANT_PROMPT },
@@ -310,10 +403,184 @@ async function askOperatorAssistant(messages) {
 
   return {
     ok: true,
-    model: OPENROUTER_MODEL,
+    model: OPENROUTER_ASSISTANT_MODEL,
     reply: typeof parsed.reply === 'string' ? parsed.reply : content || 'Tidak ada jawaban dari model.',
     action,
     usage: payload?.usage || null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Voice conversation (OpenRouter STT + TTS), limited to a short session.
+// ---------------------------------------------------------------------------
+
+const voiceSessions = new Map();
+
+function pruneVoiceSessions() {
+  const now = Date.now();
+  for (const [id, sess] of voiceSessions) {
+    if (!sess || sess.expiresAt <= now) voiceSessions.delete(id);
+  }
+}
+
+function pcm16ToWav(pcm, sampleRate = 24000) {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+async function transcribeWithOpenRouter({ audioBase64, format = 'wav' }) {
+  if (!OPENROUTER_API_KEY) {
+    return { ok: false, error: 'OPENROUTER_API_KEY belum diisi di .env' };
+  }
+  metrics.vlmCalls += 1;
+  let response;
+  try {
+    response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(Number(process.env.VOICE_STT_TIMEOUT_MS || 60000)),
+      headers: {
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': SITE_URL,
+        'X-Title': APP_NAME,
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_STT_MODEL,
+        temperature: 0,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'Transkripsikan audio ini kata per kata dalam bahasa Indonesia. Balas HANYA teks transkrip, tanpa penjelasan atau tanda kutip.',
+              },
+              { type: 'input_audio', input_audio: { data: audioBase64, format } },
+            ],
+          },
+        ],
+      }),
+    });
+  } catch (err) {
+    return { ok: false, error: `STT tidak dapat dihubungi: ${err?.message || String(err)}` };
+  }
+
+  const raw = await response.text();
+  let payload;
+  try { payload = JSON.parse(raw); } catch { payload = { raw }; }
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: response.status,
+      error: payload?.error?.message || payload?.message || `STT error ${response.status}`,
+    };
+  }
+  const content = payload?.choices?.[0]?.message?.content;
+  const text = (Array.isArray(content) ? content.map((p) => p?.text || '').join(' ') : content || '').trim();
+  return { ok: true, text, model: OPENROUTER_STT_MODEL, usage: payload?.usage || null };
+}
+
+async function synthesizeWithOpenRouter(text) {
+  if (!OPENROUTER_API_KEY) {
+    return { ok: false, error: 'OPENROUTER_API_KEY belum diisi di .env' };
+  }
+  const spoken = String(text || '').slice(0, 1500);
+  if (!spoken.trim()) return { ok: false, error: 'Teks untuk TTS kosong' };
+
+  metrics.vlmCalls += 1;
+  let response;
+  try {
+    response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(Number(process.env.VOICE_TTS_TIMEOUT_MS || 120000)),
+      headers: {
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': SITE_URL,
+        'X-Title': APP_NAME,
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_TTS_MODEL,
+        temperature: 0.2,
+        stream: true,
+        modalities: ['text', 'audio'],
+        audio: { voice: OPENROUTER_TTS_VOICE, format: 'pcm16' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a text-to-speech engine. Read the user text exactly and verbatim in Indonesian. Do not add greetings, preambles, explanations, or extra words.',
+          },
+          { role: 'user', content: spoken },
+        ],
+      }),
+    });
+  } catch (err) {
+    return { ok: false, error: `TTS tidak dapat dihubungi: ${err?.message || String(err)}` };
+  }
+
+  if (!response.ok) {
+    const raw = await response.text().catch(() => '');
+    let payload;
+    try { payload = JSON.parse(raw); } catch { payload = { raw }; }
+    return {
+      ok: false,
+      status: response.status,
+      error: payload?.error?.message || payload?.message || `TTS error ${response.status}`,
+    };
+  }
+
+  const chunks = [];
+  let transcript = '';
+  let buffer = '';
+  const decoder = new TextDecoder();
+  const reader = response.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') continue;
+      let event;
+      try { event = JSON.parse(data); } catch { continue; }
+      if (event?.error) {
+        return { ok: false, error: event.error?.message || 'TTS stream error' };
+      }
+      for (const choice of event?.choices || []) {
+        const audio = choice?.delta?.audio;
+        if (audio?.data) chunks.push(Buffer.from(audio.data, 'base64'));
+        if (audio?.transcript) transcript += audio.transcript;
+      }
+    }
+  }
+
+  const pcm = Buffer.concat(chunks);
+  if (!pcm.length) return { ok: false, error: 'TTS tidak menghasilkan audio' };
+  return {
+    ok: true,
+    audioBase64: pcm16ToWav(pcm, 24000).toString('base64'),
+    mimeType: 'audio/wav',
+    model: OPENROUTER_TTS_MODEL,
+    voice: OPENROUTER_TTS_VOICE,
+    transcript,
   };
 }
 
@@ -369,8 +636,15 @@ const server = http.createServer(async (req, res) => {
     return json(res, redisOk ? 200 : 503, {
       ok: redisOk,
       redis: redisOk,
-      vlmConfigured: Boolean(OPENROUTER_API_KEY),
-      model: OPENROUTER_MODEL,
+      vlmConfigured: VLM_PROVIDER === 'vllm' || Boolean(OPENROUTER_API_KEY),
+      vlmProvider: VLM_PROVIDER,
+      vlmModel: VLM_MODEL,
+      assistantModel: OPENROUTER_ASSISTANT_MODEL,
+      voice: {
+        sttModel: OPENROUTER_STT_MODEL,
+        ttsModel: OPENROUTER_TTS_MODEL,
+        maxSeconds: VOICE_MAX_SECONDS,
+      },
       activeSseClients: sseClients.size,
       uptimeSeconds: Math.round(process.uptime()),
     });
@@ -455,6 +729,45 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // VLM provider diagnostics (no secrets). Used by the gate terminal and ops.
+  if (req.method === 'GET' && url.pathname === '/api/vlm/status') {
+    if (VLM_PROVIDER !== 'vllm') {
+      return json(res, 200, {
+        ok: true,
+        provider: 'openrouter',
+        model: OPENROUTER_VLM_MODEL,
+        configured: Boolean(OPENROUTER_API_KEY),
+      });
+    }
+    try {
+      const r = await fetch(`${VLLM_BASE_URL}/models`, {
+        headers: vllmHeaders(),
+        signal: AbortSignal.timeout(3000),
+      });
+      const data = r.ok ? await r.json().catch(() => ({})) : {};
+      const models = (data?.data || []).map((m) => m?.id).filter(Boolean);
+      return json(res, 200, {
+        ok: true,
+        provider: 'vllm',
+        baseUrl: VLLM_BASE_URL,
+        configuredModel: VLLM_MODEL,
+        resolvedModel: resolvedVllmModel || null,
+        reachable: r.ok,
+        status: r.status,
+        models,
+      });
+    } catch (err) {
+      return json(res, 200, {
+        ok: true,
+        provider: 'vllm',
+        baseUrl: VLLM_BASE_URL,
+        configuredModel: VLLM_MODEL,
+        reachable: false,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
   // Standalone VLM plate OCR endpoint
   if (req.method === 'POST' && url.pathname === '/api/vlm/plate') {
     try {
@@ -486,12 +799,21 @@ const server = http.createServer(async (req, res) => {
             plate: result.ok ? result.result?.plate || null : null,
             confidence: result.ok ? result.result?.confidence : undefined,
             error: result.ok ? undefined : result.error,
+            provider: result.provider,
+            model: result.model,
           };
         })
       );
 
       const decision = consensusPlate(results);
-      return json(res, 200, { ok: true, model: OPENROUTER_MODEL, ...decision, frames: results });
+      const first = results.find((r) => r.model) || {};
+      return json(res, 200, {
+        ok: true,
+        provider: first.provider || VLM_PROVIDER,
+        model: first.model || VLM_MODEL,
+        ...decision,
+        frames: results,
+      });
     } catch (err) {
       return json(res, 400, { ok: false, error: err?.message || String(err) });
     }
@@ -619,6 +941,99 @@ const server = http.createServer(async (req, res) => {
       const events = await getEventHistory({ date, from, to, limit });
       return json(res, 200, { ok: true, events });
     } catch (err) {
+      return json(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  }
+
+  // Admin: start a short voice conversation session (default 120 seconds)
+  if (req.method === 'POST' && url.pathname === '/api/admin/voice/session') {
+    pruneVoiceSessions();
+    const id = crypto.randomBytes(16).toString('hex');
+    const expiresAt = Date.now() + VOICE_MAX_SECONDS * 1000;
+    voiceSessions.set(id, { expiresAt, createdAt: Date.now() });
+    return json(res, 200, {
+      ok: true,
+      voiceSessionId: id,
+      maxSeconds: VOICE_MAX_SECONDS,
+      expiresAt,
+      sttModel: OPENROUTER_STT_MODEL,
+      ttsModel: OPENROUTER_TTS_MODEL,
+    });
+  }
+
+  // Admin: one voice turn — audio -> STT -> operator assistant -> TTS
+  if (req.method === 'POST' && url.pathname === '/api/admin/voice') {
+    try {
+      pruneVoiceSessions();
+      const body = JSON.parse((await readBody(req, 24 * 1024 * 1024)) || '{}');
+      const voiceSessionId = String(body.voiceSessionId || '');
+      const voiceSession = voiceSessions.get(voiceSessionId);
+      if (!voiceSession || Date.now() > voiceSession.expiresAt) {
+        voiceSessions.delete(voiceSessionId);
+        return json(res, 410, {
+          ok: false,
+          error: `Sesi suara ${VOICE_MAX_SECONDS} detik sudah berakhir. Mulai sesi baru.`,
+        });
+      }
+
+      let audioBase64 = String(body.audioBase64 || '');
+      if (audioBase64.startsWith('data:')) {
+        audioBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '');
+      }
+      if (!audioBase64) return json(res, 400, { ok: false, error: 'audioBase64 wajib diisi' });
+
+      const audioBuffer = Buffer.from(audioBase64, 'base64');
+      if (!audioBuffer.length) return json(res, 400, { ok: false, error: 'Audio kosong' });
+      if (audioBuffer.length > VOICE_MAX_BYTES) {
+        return json(res, 413, { ok: false, error: 'Audio terlalu besar' });
+      }
+
+      const format = String(body.format || 'wav').toLowerCase();
+      if (!['wav', 'mp3'].includes(format)) {
+        return json(res, 400, { ok: false, error: 'Format audio harus wav atau mp3' });
+      }
+
+      const stt = await transcribeWithOpenRouter({ audioBase64, format });
+      if (!stt.ok) return json(res, 502, stt);
+      if (!stt.text) {
+        return json(res, 422, {
+          ok: false,
+          error: 'Suara tidak terdeteksi. Coba bicara lebih dekat ke mikrofon.',
+        });
+      }
+
+      const history = Array.isArray(body.messages)
+        ? body.messages
+            .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+            .slice(-12)
+            .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }))
+        : [];
+
+      const assistant = await askOperatorAssistant([
+        ...history,
+        { role: 'user', content: stt.text },
+      ]);
+      if (!assistant.ok) return json(res, 502, assistant);
+
+      const tts = await synthesizeWithOpenRouter(assistant.reply);
+      return json(res, 200, {
+        ok: true,
+        transcript: stt.text,
+        reply: assistant.reply,
+        action: assistant.action,
+        audioBase64: tts.ok ? tts.audioBase64 : null,
+        audioMimeType: tts.ok ? tts.mimeType : null,
+        audioError: tts.ok ? null : tts.error,
+        models: {
+          stt: stt.model,
+          assistant: assistant.model,
+          tts: tts.ok ? tts.model : OPENROUTER_TTS_MODEL,
+        },
+        usage: { stt: stt.usage || null, assistant: assistant.usage || null },
+      });
+    } catch (err) {
+      metrics.errors += 1;
+      log('error', 'voice_failed', { error: err?.message || String(err) });
       return json(res, 500, { ok: false, error: err?.message || String(err) });
     }
   }
@@ -823,14 +1238,21 @@ initMasterData()
     startScheduler(30000);
     if (!ADMIN_API_TOKEN) log('warn', 'admin_token_missing', { note: 'admin API is open' });
     if (!GATE_API_TOKEN) log('warn', 'gate_token_missing', { note: 'gate/VLM API is open' });
-    if (!OPENROUTER_API_KEY) log('warn', 'openrouter_key_missing');
+    if (VLM_PROVIDER === 'vllm') {
+      log('info', 'vlm_provider', { provider: 'vllm', baseUrl: VLLM_BASE_URL, model: VLLM_MODEL });
+    } else if (!OPENROUTER_API_KEY) {
+      log('warn', 'openrouter_key_missing');
+    }
+    if (!OPENROUTER_API_KEY) log('warn', 'voice_and_assistant_unavailable');
   })
   .catch((err) => log('error', 'startup_failed', { error: String(err) }));
 
 server.listen(PORT, HOST, () => {
   log('info', 'server_listening', {
     url: `http://${HOST}:${PORT}`,
-    model: OPENROUTER_MODEL,
+    vlmProvider: VLM_PROVIDER,
+    vlmModel: VLM_MODEL,
+    assistantModel: OPENROUTER_ASSISTANT_MODEL,
   });
 });
 

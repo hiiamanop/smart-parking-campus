@@ -19,10 +19,12 @@ Browser (driver / admin / gate)
    ▼
 smart-parking-api (Node http, :8788)
    ├─ Redis      sesi, master data, counter kuota, event, statistik
-   └─ OpenRouter VLM plat nomor + asisten operator
+   ├─ vLLM lokal VLM plat nomor (OpenAI-compatible)
+   └─ OpenRouter asisten operator + voice (STT/TTS)
 ```
 
 - API key OpenRouter hanya di server.
+- VLM plat nomor dilayani vLLM lokal agar banyak kamera/gate bisa membaca plat paralel.
 - Live update memakai Redis Pub/Sub → SSE `/api/events` (semua app + browser).
 
 ## Alur utama
@@ -35,7 +37,7 @@ Gate masuk: scan QR + kamera baca plat (VLM) -> ENTERED, palang buka
         ▼
 Di zona: scan QR tiang zona -> PARKED_CONFIRMED
         ▼
-Pulang: tombol di app -> CHECKOUT_REQUESTED (tanpa scan QR zona)
+Pulang: geser tombol ke kanan -> CHECKOUT_REQUESTED (tanpa scan QR zona)
         ▼
 Bayar di app -> PAID + QR keluar OUT-xxxxxxxx (berlaku 20 menit)
         ▼
@@ -97,15 +99,26 @@ Vite memproxy `/api` ke `127.0.0.1:8788`.
 OPENROUTER_API_KEY=sk-or-...
 REDIS_URL=redis://127.0.0.1:6379
 
-# Model (dipakai VLM plat dan asisten operator)
-OPENROUTER_VLM_MODEL=google/gemini-3.5-flash
+# Asisten operator + voice (STT/TTS) via OpenRouter
+OPENROUTER_ASSISTANT_MODEL=deepseek/deepseek-v4-flash
+OPENROUTER_STT_MODEL=openai/gpt-audio
+OPENROUTER_TTS_MODEL=openai/gpt-audio
+OPENROUTER_TTS_VOICE=nova
+VOICE_MAX_SECONDS=120
+
+# VLM plat nomor: server lokal OpenAI-compatible (vLLM)
+# Jalankan vLLM dengan --served-model-name sesuai VLLM_MODEL.
+VLM_PROVIDER=vllm
+VLLM_BASE_URL=http://host.docker.internal:8001/v1
+VLLM_MODEL=gemma-4-12b
+VLLM_API_KEY=
+VLM_TIMEOUT_MS=90000
 
 # Token akses. Kosong = API terbuka (hanya untuk dev)
 ADMIN_API_TOKEN=token-admin-panjang
 GATE_API_TOKEN=token-gate-panjang
 
 # Opsional
-VLM_TIMEOUT_MS=20000
 ASSISTANT_TIMEOUT_MS=30000
 HISTORY_DIR=./data/history
 SUPABASE_URL=
@@ -166,4 +179,5 @@ docs/       BRD, user story, backlog
 - Pembayaran QRIS masih simulasi (tanpa gateway).
 - Palang gate fisik belum diintegrasikan; status palang hanya di layar kiosk.
 - Identitas driver belum ada autentikasi (cukup nama pada booking).
-- Asisten operator memakai model yang sama dengan VLM; perubahan data selalu perlu persetujuan operator di UI.
+- Asisten operator memakai DeepSeek V4 Flash (terpisah dari VLM); perubahan data selalu perlu persetujuan operator di UI, termasuk aksi bulk.
+- VLM plat nomor memakai vLLM lokal (OpenAI-compatible) agar tahan banyak input paralel; tanpa server vLLM, pembacaan plat akan gagal dengan pesan yang jelas.

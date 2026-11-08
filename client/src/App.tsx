@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 
 interface Domain {
@@ -53,6 +53,97 @@ interface ParkingSession {
 const API_BASE = typeof window !== 'undefined' && window.location.port === '5174' ? 'http://127.0.0.1:8788' : '';
 
 const formatRupiah = (value: number) => `Rp${value.toLocaleString('id-ID')}`;
+
+// Swipe-to-confirm control used when the driver wants to go home.
+function SwipeToGoHome({ onComplete, loading }: { onComplete: () => void; loading: boolean }) {
+  const [dragX, setDragX] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const startXRef = useRef(0);
+  const maxRef = useRef(0);
+  const completedRef = useRef(false);
+
+  useEffect(() => {
+    if (!loading) {
+      completedRef.current = false;
+      setDragX(0);
+    }
+  }, [loading]);
+
+  const begin = (clientX: number, target: HTMLElement, pointerId?: number) => {
+    if (loading) return;
+    const track = trackRef.current;
+    if (!track) return;
+    startXRef.current = clientX;
+    maxRef.current = Math.max(0, track.clientWidth - 64);
+    setDragging(true);
+    if (pointerId !== undefined) target.setPointerCapture?.(pointerId);
+  };
+
+  const move = (clientX: number) => {
+    if (!dragging || loading) return;
+    const dx = Math.max(0, Math.min(maxRef.current, clientX - startXRef.current));
+    setDragX(dx);
+    if (!completedRef.current && maxRef.current > 0 && dx >= maxRef.current * 0.82) {
+      completedRef.current = true;
+      setDragging(false);
+      onComplete();
+    }
+  };
+
+  const end = () => {
+    if (!dragging) return;
+    setDragging(false);
+    if (!completedRef.current) setDragX(0);
+  };
+
+  const progress = maxRef.current ? Math.min(1, dragX / maxRef.current) : 0;
+
+  return (
+    <div className="swipe-home">
+      <p className="action-hint">
+        Geser tombol ke kanan sebagai tanda mau pulang. Setelah itu lanjut ke pembayaran.
+      </p>
+      <div
+        ref={trackRef}
+        className={`swipe-track ${dragging ? 'dragging' : ''} ${loading ? 'loading' : ''}`}
+        style={{
+          background: `linear-gradient(90deg, #4f46e5 ${progress * 100}%, #e2e8f0 ${progress * 100}%)`,
+        }}
+      >
+        <span className="swipe-track-label" style={{ opacity: Math.max(0.2, 1 - progress * 1.25) }}>
+          {loading ? 'Menghitung tagihan…' : 'Geser untuk pulang'}
+        </span>
+        <button
+          type="button"
+          className="swipe-knob"
+          aria-label="Geser ke kanan untuk pulang dan lanjut ke pembayaran"
+          disabled={loading}
+          style={{
+            transform: `translateX(${dragX}px)`,
+            transition: dragging ? 'none' : 'transform 180ms ease',
+          }}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            begin(e.clientX, e.currentTarget, e.pointerId);
+          }}
+          onPointerMove={(e) => move(e.clientX)}
+          onPointerUp={end}
+          onPointerCancel={end}
+          onKeyDown={(e) => {
+            if ((e.key === 'Enter' || e.key === ' ') && !loading) {
+              e.preventDefault();
+              onComplete();
+            }
+          }}
+        >
+          <span aria-hidden="true">{loading ? '…' : '→'}</span>
+        </button>
+        <span className="swipe-track-end" aria-hidden="true">Pulang</span>
+      </div>
+    </div>
+  );
+}
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'parking' | 'timeline'>('parking');
@@ -286,9 +377,7 @@ function ExploreView({
     if (selectedPill !== 'all') list = list.filter((z) => z.domainId === selectedPill);
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      list = list.filter(
-        (z) => z.name.toLowerCase().includes(q) || z.domainId.toLowerCase().includes(q)
-      );
+      list = list.filter((z) => z.name.toLowerCase().includes(q));
     }
     return list;
   }, [zones, selectedPill, searchQuery, selectedVehicle]);
@@ -340,7 +429,7 @@ function ExploreView({
         <input
           className="search-field"
           type="text"
-          placeholder="Cari zona atau fakultas"
+          placeholder="Cari nama zona"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
         />
@@ -938,12 +1027,7 @@ function TimelineTicketView({
       )}
 
       {activeSession.status === 'PARKED_CONFIRMED' && (
-        <div>
-          <p className="action-hint">Tidak perlu memindai QR zona lagi untuk pulang.</p>
-          <button type="button" className="btn-primary-block" disabled={loading} onClick={handleCheckoutRequest}>
-            {loading ? 'Menghitung tagihan…' : 'Lanjut ke pembayaran'}
-          </button>
-        </div>
+        <SwipeToGoHome onComplete={handleCheckoutRequest} loading={loading} />
       )}
 
       {activeSession.status === 'CHECKOUT_REQUESTED' && (
