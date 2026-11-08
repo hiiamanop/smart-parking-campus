@@ -23,6 +23,8 @@ Kamera aktif terus
 ```
 
 - Tidak ada tombol kedua; QR memicu pembacaan plat secara sekuensial.
+- Bila kotak plat sudah terdeteksi, frame burst berikutnya di-crop ulang di area plat
+  (dengan re-deteksi ringan), sehingga VLM menerima gambar plat—bukan frame penuh.
 - Tombol **Scan ulang** tersedia setelah hasil.
 - Mode masuk/keluar dipilih di layar kiosk.
 
@@ -31,6 +33,14 @@ Kamera aktif terus
 - Layar awal meminta `GATE_API_TOKEN`.
 - Disimpan di `localStorage` (`smart_parking_gate_token`) atau dari `VITE_GATE_TOKEN` saat build.
 - Dikirim sebagai `Authorization: Bearer` ke `/api/gates/*` dan `/api/vlm/*`.
+
+## Identitas gate (rate limit per perangkat)
+
+- Buka kiosk dengan `?gate=gate-masuk-1` (atau `?gate=gate-keluar-1`). Nilai disimpan di
+  `localStorage` (`smart_parking_gate_id`) dan dikirim sebagai header `x-gate-id`.
+- API memakai `x-gate-id` sebagai kunci rate limit VLM, sehingga kuota satu gate tidak
+  memotong kuota gate lain di belakang NAT kampus. Fallback: token API, lalu IP klien.
+- Tanpa `?gate=`, identitas default adalah `gate-entry` / `gate-exit` sesuai mode.
 
 ## Telemetri kualitas kamera
 

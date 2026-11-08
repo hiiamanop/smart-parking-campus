@@ -113,6 +113,8 @@ VLLM_BASE_URL=http://host.docker.internal:8001/v1
 VLLM_MODEL=qwen3-vl-8b-awq
 VLLM_API_KEY=
 VLM_TIMEOUT_MS=90000
+# Kuota VLM per menit. Dihitung per gate (header x-gate-id), lalu token, lalu IP.
+VLM_RATE_LIMIT=120
 
 # Token akses. Kosong = API terbuka (hanya untuk dev)
 ADMIN_API_TOKEN=token-admin-panjang
@@ -188,7 +190,7 @@ Ingress Cloudflare: `parkir.` → driver, `admin-parkir.` → admin, `gate-parki
 ## Keamanan & operasi
 
 - Route `/api/admin/*`, mutasi domain/zona, `/api/gates/*`, `/api/vlm/*` dijaga bearer token.
-- Rate limit: VLM 30/menit, tulis 30/menit, baca 180/menit per IP/token.
+- Rate limit: VLM `VLM_RATE_LIMIT`/menit (default 120, key: `x-gate-id` → token → IP), tulis 30/menit, baca 180/menit.
 - `GET /health` (Redis ping), `GET /metrics` (Prometheus), log JSON terstruktur.
 - Histori: `data/history/YYYY-MM-DD.jsonl`; opsional upsert Supabase `parking_history` (`supabase/history.sql`).
 - Scheduler 30 detik melepas booking `BOOKED` yang lewat ETA + 15 menit.

@@ -1,10 +1,31 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import jsQR from 'jsqr';
 import { loadPlateDetector, getDetectorSession, detectPlate, cropPlate, type PlateBox, loadPlateRecognizer, getRecognizerSession, recognizePlate } from './plateDetector';
 
 type PipelineStep = '1_SCANNING_QR' | '2_READING_PLATE_VLM' | '3_SAVING_OPENING' | '4_GATE_OPENED';
 
 const GATE_TOKEN_KEY = 'smart_parking_gate_token';
+const GATE_ID_KEY = 'smart_parking_gate_id';
+
+// Gate identity is used by the API for per-device rate limiting.
+// Priority: ?gate=... in the URL (persisted) -> localStorage -> gate-<mode>.
+let activeGateId = '';
+
+function resolveGateId(fallback: string): string {
+  try {
+    const fromUrl = new URL(window.location.href).searchParams.get('gate');
+    if (fromUrl) {
+      const clean = fromUrl.trim().slice(0, 64);
+      localStorage.setItem(GATE_ID_KEY, clean);
+      return clean;
+    }
+    const stored = localStorage.getItem(GATE_ID_KEY);
+    if (stored) return stored.trim().slice(0, 64);
+  } catch {
+    // ignore storage/URL errors
+  }
+  return fallback;
+}
 
 function getGateToken(): string {
   try {
@@ -18,6 +39,7 @@ function gateFetch(input: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   const token = getGateToken();
   if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (activeGateId) headers.set('x-gate-id', activeGateId);
   return fetch(input, { ...init, headers });
 }
 
@@ -26,6 +48,12 @@ const API_BASE = typeof window !== 'undefined' && window.location.port === '5175
 export function App() {
   const [gateMode, setGateMode] = useState<'entry' | 'exit'>('entry');
   const [currentStep, setCurrentStep] = useState<PipelineStep>('1_SCANNING_QR');
+
+  // Stable per-kiosk identity for API rate limiting (see ?gate=... in the URL).
+  const gateId = useMemo(() => resolveGateId(`gate-${gateMode}`), [gateMode]);
+  useEffect(() => {
+    activeGateId = gateId;
+  }, [gateId]);
 
   // Camera & Stream refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -150,14 +178,39 @@ export function App() {
     setPlateStandby(false);
   }, []);
 
-  // Ambil beberapa frame berurutan dari kamera untuk konsensus OCR
-  const captureBurst = async (firstDataUrl: string, count = 3, gapMs = 320): Promise<string[]> => {
+  // Ambil beberapa frame berurutan dari kamera untuk konsensus OCR.
+  // Bila `box` tersedia, frame lanjutan di-crop ulang di area plat (dengan
+  // re-deteksi ringan) supaya VLM hanya menerima gambar plat, bukan frame penuh.
+  const captureBurst = async (
+    firstDataUrl: string,
+    count = 3,
+    gapMs = 320,
+    box?: PlateBox
+  ): Promise<string[]> => {
     const frames = [firstDataUrl];
     for (let i = 1; i < count; i += 1) {
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => setTimeout(resolve, gapMs));
-      const { dataUrl } = grabFrame();
-      if (dataUrl) frames.push(dataUrl);
+      const video = videoRef.current;
+      let next = '';
+
+      if (box && video && video.readyState >= 2) {
+        let nextBox = box;
+        const sess = detectorSessionRef.current;
+        if (sess) {
+          try {
+            const fresh = await detectPlate(sess, video, 0.4);
+            if (fresh) nextBox = fresh;
+          } catch {
+            // keep the previous box
+          }
+        }
+        next = cropPlate(video, nextBox);
+      }
+
+      // Fallback ke frame penuh bila crop gagal / tidak ada box.
+      if (!next) next = grabFrame().dataUrl;
+      if (next) frames.push(next);
     }
     return frames;
   };
@@ -235,7 +288,7 @@ export function App() {
       standbyRef.current.timer = window.setTimeout(tick, ms);
     };
 
-    const trySend = async (dataUrl: string): Promise<boolean> => {
+    const trySend = async (dataUrl: string, box?: PlateBox): Promise<boolean> => {
       attempt++;
       setPlateAttempt(attempt);
 
@@ -263,7 +316,7 @@ export function App() {
       const burstSize = attempt === 1 ? 3 : 2;
       setStatusText(`AI membaca ${burstSize} frame plat... percobaan ${attempt}/${MAX_VLM_ATTEMPTS}`);
       try {
-        const frames = await captureBurst(dataUrl, burstSize);
+        const frames = await captureBurst(dataUrl, burstSize, 320, box);
         const decision = await requestConsensus(frames);
         if (standbyRef.current.cancelled) return true;
 
@@ -327,7 +380,7 @@ export function App() {
               const crop = cropPlate(videoRef.current, box);
               if (crop) {
                 consecutiveDetectRef.current = 0;
-                const done = await trySend(crop);
+                const done = await trySend(crop, box);
                 if (done || standbyRef.current.cancelled) return;
               }
             }

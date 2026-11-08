@@ -73,7 +73,9 @@ function log(level, msg, meta = {}) {
 // Lightweight in-process metrics
 const metrics = { requests: 0, errors: 0, rateLimited: 0, authDenied: 0, vlmCalls: 0 };
 
-const limitVlm = createRateLimiter({ windowMs: 60000, max: 30 });
+// VLM quota is per gate kiosk (x-gate-id), then per token, then per IP.
+const VLM_RATE_LIMIT = Math.max(1, Number(process.env.VLM_RATE_LIMIT || 120));
+const limitVlm = createRateLimiter({ windowMs: 60000, max: VLM_RATE_LIMIT });
 const limitWrite = createRateLimiter({ windowMs: 60000, max: 30 });
 const limitRead = createRateLimiter({ windowMs: 60000, max: 180 });
 
@@ -130,6 +132,21 @@ function extractJsonObject(text) {
   const m = text.match(/\{[\s\S]*\}/);
   if (m) try { return JSON.parse(m[0]); } catch {}
   return null;
+}
+
+// Some VLM replies are a bare plate string ("B 1234 ABC") instead of JSON.
+// Recover the first Indonesian-plate-shaped token so OCR still succeeds.
+const ID_PLATE_IN_TEXT_RE = /\b([A-Z]{1,2})\s?(\d{1,4})\s?([A-Z]{0,3})\b/i;
+
+function plateFromPlainText(text) {
+  const plain = String(text || '')
+    .replace(/```[a-z]*|```/gi, ' ')
+    .replace(/["'{}[\]]/g, ' ');
+  const m = plain.match(ID_PLATE_IN_TEXT_RE);
+  if (!m) return null;
+  const plate = `${m[1]} ${m[2]} ${m[3] || ''}`.trim().toUpperCase();
+  return { plate, confidence: 0.6, vehicle_type: 'unknown', raw_text: String(text || '').trim(),
+    notes: 'Respons bukan JSON; plat diekstrak dari teks.' };
 }
 
 let resolvedVllmModel = '';
@@ -244,11 +261,12 @@ Jika plat tidak terbaca, isi plate dengan null dan jelaskan di notes.`;
   const text = payload?.choices?.[0]?.message?.content;
   const content = Array.isArray(text) ? text.map((p) => p?.text || '').join('\n') : (text || '');
   const parsed = extractJsonObject(content);
+  const fallback = parsed || plateFromPlainText(content);
   return {
     ok: true,
     provider: isLocal ? 'vllm' : 'openrouter',
     model,
-    result: parsed || { plate: null, confidence: 0, vehicle_type: 'unknown', raw_text: content, notes: 'Respons tidak berbentuk JSON.' },
+    result: fallback || { plate: null, confidence: 0, vehicle_type: 'unknown', raw_text: content, notes: 'Respons tidak berbentuk JSON.' },
     usage: payload?.usage || null,
   };
 }
@@ -640,6 +658,11 @@ const server = http.createServer(async (req, res) => {
       vlmConfigured: VLM_PROVIDER === 'vllm' || Boolean(OPENROUTER_API_KEY),
       vlmProvider: VLM_PROVIDER,
       vlmModel: VLM_MODEL,
+      vlmRateLimit: {
+        windowMs: 60000,
+        maxPerMinute: VLM_RATE_LIMIT,
+        keyPrecedence: ['x-gate-id', 'x-api-token', 'client-ip'],
+      },
       assistantModel: OPENROUTER_ASSISTANT_MODEL,
       voice: {
         sttModel: OPENROUTER_STT_MODEL,
@@ -674,11 +697,17 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // Rate limiting: VLM is the most expensive surface
+  // Rate limiting: VLM is the most expensive surface.
+  // Key precedence: gate device id > API token > client IP, so one busy kiosk
+  // (or campus NAT) cannot exhaust the quota for every other gate.
   const isVlmPath = url.pathname.startsWith('/api/vlm/');
   const isWrite = ['POST', 'PUT', 'DELETE'].includes(req.method || '');
   const limiter = isVlmPath ? limitVlm : isWrite ? limitWrite : limitRead;
-  const rateKey = req.headers['x-api-token'] || clientIp(req);
+  const gateIdHeader = req.headers['x-gate-id'];
+  const gateId = typeof gateIdHeader === 'string' ? gateIdHeader.trim().slice(0, 64) : '';
+  const rateKey = gateId
+    ? `gate:${gateId}`
+    : req.headers['x-api-token'] || clientIp(req);
   const rateResult = limiter(String(rateKey));
   if (!rateResult.allowed) return rateLimited(res, rateResult);
 
