@@ -107,10 +107,10 @@ OPENROUTER_TTS_VOICE=nova
 VOICE_MAX_SECONDS=120
 
 # VLM plat nomor: server lokal OpenAI-compatible (vLLM)
-# Jalankan vLLM dengan --served-model-name sesuai VLLM_MODEL.
+# Default: Qwen3-VL-8B-Instruct-AWQ-4bit (muat di GPU 12 GB).
 VLM_PROVIDER=vllm
 VLLM_BASE_URL=http://host.docker.internal:8001/v1
-VLLM_MODEL=gemma-4-12b
+VLLM_MODEL=qwen3-vl-8b-awq
 VLLM_API_KEY=
 VLM_TIMEOUT_MS=90000
 
@@ -124,6 +124,47 @@ HISTORY_DIR=./data/history
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_TABLE=parking_history
+```
+
+## vLLM lokal (pembacaan plat)
+
+Pembacaan plat memakai VLM lokal lewat vLLM (OpenAI-compatible) supaya banyak
+kamera/gate bisa mengirim gambar paralel tanpa rate limit OpenRouter.
+
+Default di repo ini: **Qwen3-VL-8B-Instruct-AWQ-4bit** (~7,6 GB). Model 12B
+AWQ (mis. Gemma 4 12B, ~11,25 GB) tidak muat di RTX 3060 12 GB bersama KV cache.
+
+```bash
+# 1) Siapkan environment (sekali saja)
+cd ~/workspace
+uv venv vllm-env --python 3.12
+uv pip install --python vllm-env/bin/python --torch-backend=auto vllm
+HF_HOME=~/workspace/hf-cache uvx --from 'huggingface_hub[cli]' \
+  hf download cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit \
+  --local-dir ~/workspace/models/qwen3-vl-8b-awq
+
+# 2) Jalankan server (port 8001, otomatis terbaca dari container)
+./deploy/start-vllm.sh
+```
+
+Cek kesiapan:
+
+```bash
+curl -s http://<ip-host>:8001/v1/models
+curl -s http://127.0.0.1:8788/api/vlm/status
+```
+
+`deploy/start-vllm.sh` memakai `--gpu-memory-utilization 0.90`, `--max-model-len 6144`,
+`--max-num-seqs 8`, dan menonaktifkan JIT flashinfer (host tanpa nvcc).
+
+Auto-start saat boot (systemd user, `Linger=yes`):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/vllm-plate.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now vllm-plate.service
+systemctl --user status vllm-plate.service
 ```
 
 ## Build, tes, deploy

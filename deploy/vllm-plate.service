@@ -1,0 +1,19 @@
+[Unit]
+Description=Local vLLM plate reader (Qwen3-VL 8B AWQ)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/smart-parking
+Environment=HF_HOME=%h/workspace/hf-cache
+Environment=VLLM_USE_FLASHINFER_SAMPLER=0
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/workspace/smart-parking/deploy/start-vllm.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=40
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target
