@@ -49,6 +49,12 @@ interface ParkingSession {
     total: number;
     isOverstay: boolean;
   };
+  payment?: {
+    method?: string;
+    paidAt?: string;
+    transactionId?: string;
+    amount?: number;
+  };
 }
 
 const API_BASE = typeof window !== 'undefined' && window.location.port === '5174' ? 'http://127.0.0.1:8788' : '';
@@ -369,11 +375,9 @@ export function App() {
             updateSession(null);
             return;
           }
-          if (
-            res.session.status === 'COMPLETED' ||
-            res.session.status === 'EXPIRED' ||
-            res.session.status === 'CANCELLED'
-          ) {
+          // A completed session stays visible as the exit receipt until the
+          // driver dismisses it. Only cancelled/expired tickets are dropped.
+          if (res.session.status === 'EXPIRED' || res.session.status === 'CANCELLED') {
             updateSession(null);
           } else {
             updateSession(res.session);
@@ -406,38 +410,24 @@ export function App() {
           if (event.payload?.domains) setDomains(event.payload.domains);
         }
 
-        if (activeSession && (event.payload?.sessionCode === activeSession.sessionCode || event.type === 'GATE_EXIT_SUCCESS')) {
-          if (event.type === 'GATE_EXIT_SUCCESS' && event.payload?.sessionCode === activeSession.sessionCode) {
-            setExitNotice('Kendaraan tercatat keluar. Tiket ditutup.');
-            setTimeout(() => {
-              updateSession(null);
-              setExitNotice(null);
-            }, 2500);
-          } else {
-            fetch(`${API_BASE}/api/sessions/${activeSession.sessionCode}`)
-              .then((r) => r.json())
-              .then((res) => {
-                if (res.ok && res.session) {
-                  if (
-                    res.session.status === 'COMPLETED' ||
-                    res.session.status === 'EXPIRED' ||
-                    res.session.status === 'CANCELLED'
-                  ) {
-                    setExitNotice(
-                      res.session.status === 'COMPLETED'
-                        ? 'Kendaraan tercatat keluar. Tiket ditutup.'
-                        : null
-                    );
-                    setTimeout(() => {
-                      updateSession(null);
-                      setExitNotice(null);
-                    }, res.session.status === 'COMPLETED' ? 2500 : 0);
-                  } else {
-                    updateSession(res.session);
-                  }
-                }
-              });
+        if (activeSession && event.payload?.sessionCode === activeSession.sessionCode) {
+          if (event.type === 'GATE_EXIT_SUCCESS') {
+            setExitNotice('Kendaraan tercatat keluar. Tiket tetap tersimpan sebagai bukti.');
+            setTimeout(() => setExitNotice(null), 5000);
           }
+          fetch(`${API_BASE}/api/sessions/${activeSession.sessionCode}`)
+            .then((r) => r.json())
+            .then((res) => {
+              if (res.ok && res.session) {
+                // Keep COMPLETED so the driver still sees the exit receipt;
+                // only drop tickets that can no longer be used.
+                if (res.session.status === 'EXPIRED' || res.session.status === 'CANCELLED') {
+                  updateSession(null);
+                } else {
+                  updateSession(res.session);
+                }
+              }
+            });
         }
       } catch {}
     };
@@ -503,7 +493,7 @@ export function App() {
           onClick={() => setActiveTab('timeline')}
         >
           Tiket saya
-          {activeSession && <span className="tab-dot" />}
+          {activeSession && activeSession.status !== 'COMPLETED' && <span className="tab-dot" />}
         </button>
       </nav>
     </div>
@@ -1083,6 +1073,83 @@ function TimelineTicketView({
         <p>Pesan slot terlebih dahulu untuk mendapatkan tiket QR parkir.</p>
         <button type="button" className="btn-primary-block" onClick={onGoToExplore}>
           Cari slot parkir
+        </button>
+      </div>
+    );
+  }
+
+  if (activeSession.status === 'COMPLETED') {
+    const entryMs = activeSession.entryTime ? new Date(activeSession.entryTime).getTime() : null;
+    const exitMs = activeSession.exitTime ? new Date(activeSession.exitTime).getTime() : null;
+    const durationMin =
+      entryMs && exitMs ? Math.max(0, Math.round((exitMs - entryMs) / 60000)) : null;
+    const clock = (iso?: string) =>
+      iso
+        ? new Date(iso).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })
+        : '—';
+
+    return (
+      <div>
+        <div className="page-nav">
+          <span className="page-nav-title">Sesi selesai</span>
+        </div>
+
+        <div className="receipt-hero">
+          <div className="receipt-check" aria-hidden="true">✓</div>
+          <strong>Kendaraan sudah keluar</strong>
+          <p>Palang keluar terbuka. Tiket tetap tersimpan sebagai bukti parkir Anda.</p>
+        </div>
+
+        <dl className="detail-list">
+          <div className="detail-row">
+            <dt>Zona</dt>
+            <dd>{currentZone?.name || activeSession.zoneId}</dd>
+          </div>
+          <div className="detail-row">
+            <dt>Plat nomor</dt>
+            <dd>
+              <span className="plate-chip">{activeSession.plate || '—'}</span>
+            </dd>
+          </div>
+          <div className="detail-row">
+            <dt>Masuk</dt>
+            <dd>{clock(activeSession.entryTime)}</dd>
+          </div>
+          <div className="detail-row">
+            <dt>Keluar</dt>
+            <dd>{clock(activeSession.exitTime)}</dd>
+          </div>
+          {durationMin !== null && (
+            <div className="detail-row">
+              <dt>Durasi</dt>
+              <dd>
+                {durationMin < 60
+                  ? `${durationMin} menit`
+                  : `${Math.floor(durationMin / 60)} jam ${durationMin % 60} menit`}
+              </dd>
+            </div>
+          )}
+          <div className="detail-row">
+            <dt>Total dibayar</dt>
+            <dd className="text-ok">{formatRupiah(activeSession.bill?.total ?? 0)}</dd>
+          </div>
+          {activeSession.payment?.method && (
+            <div className="detail-row">
+              <dt>Metode</dt>
+              <dd>{activeSession.payment.method}</dd>
+            </div>
+          )}
+        </dl>
+
+        <button
+          type="button"
+          className="btn-primary-block"
+          onClick={() => {
+            onUpdateSession(null);
+            onGoToExplore();
+          }}
+        >
+          Selesai
         </button>
       </div>
     );

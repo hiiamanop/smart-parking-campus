@@ -517,6 +517,32 @@ button { font: inherit; }
 .detail-row dt { color: var(--muted); font-size: 12.5px; }
 .detail-row dd { margin: 0; font-weight: 600; color: var(--ink); text-align: right; }
 
+/* Completed-session receipt */
+.receipt-hero {
+  text-align: center;
+  padding: 22px 18px;
+  margin-bottom: 14px;
+  border: 1px solid #cfe4d6;
+  border-radius: 12px;
+  background: #f0f8f2;
+}
+.receipt-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  margin: 0 auto 10px;
+  border-radius: 999px;
+  background: var(--ok);
+  color: #fff;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+}
+.receipt-hero strong { display: block; font-size: 14px; font-weight: 650; color: var(--ink); }
+.receipt-hero p { margin-top: 5px; font-size: 12px; line-height: 1.5; color: var(--muted); }
+
 /* ------------------------------------------------------------------ */
 /* Form                                                               */
 /* ------------------------------------------------------------------ */
