@@ -160,6 +160,63 @@ npm run test:server    # store + consensus + API (Redis DB 15, port 8799)
 docker compose up -d --build
 ```
 
+### Tes E2E
+
+Ada dua lapis tes end-to-end:
+
+**1. E2E backend/API** (`npm run test:server`) — menjalankan server terisolasi di
+Redis DB 15 dan menguji siklus penuh lewat HTTP: booking → gate masuk → konfirmasi
+zona → checkout → bayar → gate keluar, plus pembatalan, pindah zona, dan proteksi
+hapus zona yang masih dipakai. Tidak butuh browser atau OpenRouter.
+
+**2. E2E browser/UI** (Playwright) — menguji aplikasi yang sedang berjalan:
+
+```bash
+docker compose up -d              # stack harus hidup
+npm run test:e2e:install          # sekali saja, unduh Chromium
+npm run test:e2e                  # jalankan semua skenario
+npm run test:e2e:ui               # mode interaktif untuk debug
+npm run test:e2e:report           # buka laporan HTML
+```
+
+Skenario yang dicakup:
+
+- Dashboard admin tampil dan navigasi antar menu bekerja.
+- Asisten operator: balasan kaya, kartu aksi, persetujuan aksi, peringatan aksi
+  hapus, tombol **Terapkan semua**, dan layout mobile.
+- Booking dari aplikasi driver → tiket terbit → sesi muncul di admin → booking
+  dibatalkan lagi (cleanup otomatis).
+- Kiosk gate tampil dan bisa berpindah mode masuk/keluar.
+
+Tes berjalan berurutan (`workers: 1`) dan membuat satu booking sementara yang
+selalu dibatalkan di blok `finally`. Untuk data yang benar-benar terisolasi,
+arahkan tes ke stack staging, bukan produksi.
+
+Variabel opsional:
+
+| Variabel | Default | Fungsi |
+|---|---|---|
+| `E2E_ADMIN_URL` | `http://127.0.0.1:8082` | URL dashboard admin |
+| `E2E_DRIVER_URL` | `http://127.0.0.1:8081` | URL aplikasi driver |
+| `E2E_GATE_URL` | `http://127.0.0.1:8083` | URL kiosk gate |
+| `E2E_API_URL` | `http://127.0.0.1:8788` | URL API |
+| `ADMIN_API_TOKEN` | kosong | Token admin bila API diamankan |
+| `GATE_API_TOKEN` | kosong | Token gate bila API diamankan |
+| `PLAYWRIGHT_CHROMIUM_PATH` | — | Pakai binary Chromium yang sudah ada |
+
+Contoh menjalankan ke staging dengan token:
+
+```bash
+ADMIN_API_TOKEN=... GATE_API_TOKEN=... \
+E2E_ADMIN_URL=https://admin-parkir.example.com \
+E2E_DRIVER_URL=https://parkir.example.com \
+E2E_GATE_URL=https://gate-parkir.example.com \
+E2E_API_URL=https://admin-parkir.example.com \
+npm run test:e2e
+```
+
+File tes ada di `e2e/` (`admin.spec.ts`, `driver.spec.ts`, `gate.spec.ts`).
+
 | Container | Port lokal | Fungsi |
 |---|---|---|
 | `smart-parking-api` | 8788 | REST + SSE + VLM |

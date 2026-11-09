@@ -13,6 +13,13 @@
     "dev:client": "npm --prefix client run dev",
     "dev:gate": "npm --prefix gate run dev",
     "test:server": "npm --prefix server test",
-    "deploy": "npm run build && docker compose up -d --build"
+    "deploy": "npm run build && docker compose up -d --build",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:report": "playwright show-report",
+    "test:e2e:install": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
   }
 }
