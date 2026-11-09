@@ -117,11 +117,13 @@ Event yang dipublish: `BOOKED`, `GATE_ENTRY`, `ZONE_CONFIRMED`, `ZONE_MISMATCH`,
 
 ## Asisten operator
 
-`POST /api/admin/assistant` menerima `{messages:[{role,content}]}` (maks 12 pesan, 4000 char/pesan).
+`POST /api/admin/assistant` menerima `{messages:[{role,content}]}` (maks 24 pesan, 8000 char/pesan).
 
-1. Server menyusun snapshot live: domain, zona, sesi aktif, KPI hari ini.
-2. Model `OPENROUTER_VLM_MODEL` (default `google/gemini-2.5-flash`) dipaksa menjawab JSON `{reply, action}`.
-3. `action` di-whitelist (`create_domain`, `update_domain`, `delete_domain`, `create_zone`, `update_zone`, `delete_zone`, `cancel_booking`, `reissue_exit`) dan **tidak dieksekusi server**; UI yang menerapkan lewat endpoint admin biasa.
+1. Server menyusun snapshot live: domain, zona, sesi aktif (hingga 150), KPI hari ini, kualitas gate, dan event terakhir.
+2. Model `OPENROUTER_ASSISTANT_MODEL` (default `anthropic/claude-haiku-5.5`) dipaksa menjawab JSON `{reply, actions:[{type,params}]}`.
+3. `actions` di-whitelist (maks 10) dan **tidak dieksekusi server**; UI menampilkan kartu persetujuan untuk setiap aksi, lalu menerapkannya lewat endpoint admin biasa.
+4. Aksi berisiko (`delete_*`, `cancel_bookings`, `reissue_exits`, `pay_*`, `open_gate`) ditandai `destructive` dan wajib disetujui operator.
+5. Katalog mendukung CRUD domain/zona, bulk update/hapus zona, bulk cancel/reissue/checkout/bayar sesi, pindah zona (single/bulk), dan override gate darurat.
 
 ## Konsensus plat
 

@@ -34,10 +34,11 @@ Jika server tidak mengisi `ADMIN_API_TOKEN` (mode dev), app langsung masuk.
 Tombol ikon Ganesha di kanan bawah (`src/components/admin/OperatorAssistant.tsx`).
 
 - Chat dikirim ke `POST /api/admin/assistant` (butuh token admin).
-- Server menyusun snapshot data live (domain, zona, sesi aktif, KPI hari ini) lalu memanggil model `OPENROUTER_VLM_MODEL`.
-- Model **hanya mengusulkan** aksi: `create_domain`, `update_domain`, `delete_domain`, `create_zone`, `update_zone`, `delete_zone`, `cancel_booking`, `reissue_exit`.
-- Aksi dieksekusi setelah operator klik **Terapkan**; eksekusi lewat endpoint admin biasa (validasi sama). **Batal** membuang usulan.
-- Balasan model dilarang Markdown; UI tetap merapikan `-` menjadi bullet dan `**teks**` menjadi tebal.
+- Server menyusun snapshot data live (domain, zona, sesi aktif, KPI, kualitas gate, event terakhir) lalu memanggil model `OPENROUTER_ASSISTANT_MODEL` (default Claude Haiku 5.5).
+- Model **hanya mengusulkan** aksi, bisa satu atau banyak per balasan (maks 10). Katalog mencakup CRUD domain/zona, bulk update/hapus zona, bulk cancel/reissue/checkout/bayar sesi, pindah zona, dan override gate darurat.
+- Aksi dieksekusi setelah operator klik **Terapkan** (atau **Terapkan semua** untuk urutan aksi). Aksi berisiko seperti hapus/pembayaran diberi peringatan dan tombol **Setujui & terapkan**.
+- Eksekusi lewat endpoint admin biasa dengan validasi yang sama; **Batal** membuang usulan.
+- Balasan mendukung Markdown ringan (`**tebal**`, bullet, heading) dan diarahkan conversational, bukan jawaban satu kata.
 - Riwayat chat hanya di memori tab (tidak dipersist).
 
 ## Analitik

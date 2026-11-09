@@ -30,6 +30,16 @@ async function adminFetch(input: string, init: RequestInit = {}): Promise<Respon
   return res;
 }
 
+function stringList(value: unknown, limit = 150): string[] {
+  return Array.isArray(value)
+    ? value.map(String).map((s) => s.trim()).filter(Boolean).slice(0, limit)
+    : [];
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export async function fetchAuthStatus(): Promise<{ adminTokenRequired: boolean; gateTokenRequired: boolean }> {
   const res = await fetch('/api/auth/status');
   const data = await res.json();
@@ -169,11 +179,14 @@ export async function fetchEventHistory(range?: { from?: string; to?: string }):
 export interface AssistantAction {
   type: string;
   params: Record<string, unknown>;
+  destructive?: boolean;
 }
 
 export interface AssistantReply {
   reply: string;
   action: AssistantAction | null;
+  actions: AssistantAction[];
+  requiresConfirmation: boolean;
 }
 
 export async function askAssistant(
@@ -186,7 +199,17 @@ export async function askAssistant(
   });
   const data = await res.json();
   if (!res.ok || !data.ok) throw new Error(data.error || 'Asisten tidak merespons');
-  return { reply: data.reply, action: data.action || null };
+  const actions: AssistantAction[] = Array.isArray(data.actions)
+    ? data.actions
+    : data.action
+      ? [data.action]
+      : [];
+  return {
+    reply: data.reply,
+    action: data.action || actions[0] || null,
+    actions,
+    requiresConfirmation: Boolean(data.requiresConfirmation),
+  };
 }
 
 export interface VoiceSession {
@@ -208,6 +231,8 @@ export interface VoiceTurnResult {
   transcript: string;
   reply: string;
   action: AssistantAction | null;
+  actions: AssistantAction[];
+  requiresConfirmation: boolean;
   audioBase64: string | null;
   audioMimeType: string | null;
   audioError?: string | null;
@@ -230,6 +255,8 @@ export async function askVoice(payload: {
     transcript: data.transcript,
     reply: data.reply,
     action: data.action || null,
+    actions: Array.isArray(data.actions) ? data.actions : data.action ? [data.action] : [],
+    requiresConfirmation: Boolean(data.requiresConfirmation),
     audioBase64: data.audioBase64 || null,
     audioMimeType: data.audioMimeType || null,
     audioError: data.audioError || null,
@@ -242,15 +269,29 @@ export function describeAssistantAction(action: AssistantAction): string {
     create_domain: `Buat domain "${p.name ?? ''}"`,
     update_domain: `Ubah domain ${p.id ?? ''}`,
     delete_domain: `Hapus domain ${p.id ?? ''}`,
+    delete_domains: `Hapus ${Array.isArray(p.ids) ? p.ids.length : 0} domain sekaligus`,
     create_zone: `Buat zona "${p.name ?? ''}" di domain ${p.domainId ?? ''} (${p.capacity ?? '?'} slot)`,
     update_zone: `Ubah zona ${p.id ?? ''}`,
+    bulk_update_zones: `Ubah ${Array.isArray(p.ids) ? p.ids.length : 0} zona sekaligus`,
     delete_zone: `Hapus zona ${p.id ?? ''}`,
+    delete_zones: `Hapus ${Array.isArray(p.ids) ? p.ids.length : 0} zona sekaligus`,
     cancel_booking: `Batalkan booking ${p.sessionCode ?? ''}`,
     cancel_bookings: `Batalkan ${Array.isArray(p.sessionCodes) ? p.sessionCodes.length : 0} booking sekaligus`,
     reissue_exit: `Terbitkan ulang QR keluar untuk ${p.sessionCode ?? ''}`,
     reissue_exits: `Terbitkan ulang ${Array.isArray(p.sessionCodes) ? p.sessionCodes.length : 0} QR keluar sekaligus`,
+    change_zone: `Pindahkan sesi ${p.sessionCode ?? ''} ke zona ${p.zoneId ?? ''}`,
+    change_zones: `Pindahkan ${Array.isArray(p.sessionCodes) ? p.sessionCodes.length : 0} sesi ke zona ${p.zoneId ?? ''}`,
+    checkout_session: `Mulai checkout sesi ${p.sessionCode ?? ''}`,
+    checkout_sessions: `Mulai checkout ${Array.isArray(p.sessionCodes) ? p.sessionCodes.length : 0} sesi`,
+    pay_session: `Lunasi sesi ${p.sessionCode ?? ''}`,
+    pay_sessions: `Lunasi ${Array.isArray(p.sessionCodes) ? p.sessionCodes.length : 0} sesi`,
+    open_gate: `Buka gate ${p.gateType ?? ''} darurat${p.zoneId ? ` untuk zona ${p.zoneId}` : ''}`,
   };
   return label[action.type] || action.type;
+}
+
+export function isDestructiveAction(action: AssistantAction): boolean {
+  return Boolean(action.destructive) || action.type.startsWith('delete_') || action.type === 'delete_domains' || action.type === 'delete_zones' || action.type === 'cancel_booking' || action.type === 'cancel_bookings' || action.type === 'pay_session' || action.type === 'pay_sessions' || action.type === 'open_gate';
 }
 
 export async function applyAssistantAction(action: AssistantAction): Promise<string> {
@@ -367,6 +408,190 @@ export async function applyAssistantAction(action: AssistantAction): Promise<str
       return `${okCount}/${codes.length} QR keluar diterbitkan ulang. Total denda Rp${penalty.toLocaleString(
         'id-ID'
       )}.${failed.length ? ` Gagal: ${failed.join('; ')}` : ''}`;
+    }
+    case 'delete_domains': {
+      const ids = stringList(p.ids);
+      if (!ids.length) throw new Error('Daftar domain untuk dihapus kosong');
+      const ok: string[] = [];
+      const failed: string[] = [];
+      for (const id of ids) {
+        try {
+          const d = await deleteDomainApi(id);
+          ok.push(d.name);
+        } catch (err) {
+          failed.push(`${id}: ${errorText(err)}`);
+        }
+      }
+      return `${ok.length}/${ids.length} domain dihapus${ok.length ? `: ${ok.join(', ')}` : ''}.${
+        failed.length ? ` Gagal: ${failed.join('; ')}` : ''
+      }`;
+    }
+    case 'delete_zones': {
+      const ids = stringList(p.ids);
+      if (!ids.length) throw new Error('Daftar zona untuk dihapus kosong');
+      const ok: string[] = [];
+      const failed: string[] = [];
+      for (const id of ids) {
+        try {
+          const z = await deleteZoneApi(id);
+          ok.push(z.name);
+        } catch (err) {
+          failed.push(`${id}: ${errorText(err)}`);
+        }
+      }
+      return `${ok.length}/${ids.length} zona dihapus${ok.length ? `: ${ok.join(', ')}` : ''}.${
+        failed.length ? ` Gagal: ${failed.join('; ')}` : ''
+      }`;
+    }
+    case 'bulk_update_zones': {
+      const ids = stringList(p.ids);
+      if (!ids.length) throw new Error('Daftar zona kosong');
+      const patch = p.patch && typeof p.patch === 'object' ? (p.patch as Record<string, unknown>) : {};
+      if (!Object.keys(patch).length) throw new Error('Tidak ada perubahan zona yang diminta');
+      const payload: {
+        name?: string;
+        domainId?: string;
+        vehicleType?: 'car' | 'motorcycle';
+        capacity?: number;
+        gateIn?: string;
+        gateOut?: string;
+      } = {};
+      if (patch.name !== undefined) payload.name = String(patch.name);
+      if (patch.domainId !== undefined) payload.domainId = String(patch.domainId);
+      if (patch.vehicleType === 'car' || patch.vehicleType === 'motorcycle') payload.vehicleType = patch.vehicleType;
+      if (patch.capacity !== undefined) payload.capacity = Number(patch.capacity);
+      if (patch.gateIn !== undefined) payload.gateIn = String(patch.gateIn);
+      if (patch.gateOut !== undefined) payload.gateOut = String(patch.gateOut);
+      const ok: string[] = [];
+      const failed: string[] = [];
+      for (const id of ids) {
+        try {
+          const z = await updateZoneApi(id, payload);
+          ok.push(z.name);
+        } catch (err) {
+          failed.push(`${id}: ${errorText(err)}`);
+        }
+      }
+      return `${ok.length}/${ids.length} zona diperbarui${ok.length ? `: ${ok.join(', ')}` : ''}.${
+        failed.length ? ` Gagal: ${failed.join('; ')}` : ''
+      }`;
+    }
+    case 'change_zone': {
+      const res = await adminFetch('/api/bookings/change-zone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: p.sessionCode, zoneId: p.zoneId }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal memindahkan sesi');
+      return `Sesi ${p.sessionCode} dipindahkan ke zona ${p.zoneId}.`;
+    }
+    case 'change_zones': {
+      const codes = stringList(p.sessionCodes);
+      if (!codes.length) throw new Error('Daftar sesi kosong');
+      const ok: string[] = [];
+      const failed: string[] = [];
+      for (const sessionCode of codes) {
+        try {
+          const res = await adminFetch('/api/bookings/change-zone', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionCode, zoneId: p.zoneId }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal memindahkan');
+          ok.push(sessionCode);
+        } catch (err) {
+          failed.push(`${sessionCode}: ${errorText(err)}`);
+        }
+      }
+      return `${ok.length}/${codes.length} sesi dipindahkan ke zona ${p.zoneId}.${
+        failed.length ? ` Gagal: ${failed.join('; ')}` : ''
+      }`;
+    }
+    case 'checkout_session': {
+      const res = await adminFetch('/api/payments/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: p.sessionCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal memulai checkout');
+      const total = Number(data.session?.bill?.total || 0);
+      return `Checkout ${p.sessionCode} dimulai. Tagihan Rp${total.toLocaleString('id-ID')}.`;
+    }
+    case 'checkout_sessions': {
+      const codes = stringList(p.sessionCodes);
+      if (!codes.length) throw new Error('Daftar sesi kosong');
+      let okCount = 0;
+      let total = 0;
+      const failed: string[] = [];
+      for (const sessionCode of codes) {
+        try {
+          const res = await adminFetch('/api/payments/checkout', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionCode }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal checkout');
+          okCount += 1;
+          total += Number(data.session?.bill?.total || 0);
+        } catch (err) {
+          failed.push(`${sessionCode}: ${errorText(err)}`);
+        }
+      }
+      return `${okCount}/${codes.length} sesi checkout. Total tagihan Rp${total.toLocaleString('id-ID')}.${
+        failed.length ? ` Gagal: ${failed.join('; ')}` : ''
+      }`;
+    }
+    case 'pay_session': {
+      const res = await adminFetch('/api/payments/pay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: p.sessionCode, paymentMethod: p.paymentMethod || 'QRIS' }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal melunasi sesi');
+      return `Sesi ${p.sessionCode} lunas via ${p.paymentMethod || 'QRIS'}.`;
+    }
+    case 'pay_sessions': {
+      const codes = stringList(p.sessionCodes);
+      if (!codes.length) throw new Error('Daftar sesi kosong');
+      const ok: string[] = [];
+      const failed: string[] = [];
+      for (const sessionCode of codes) {
+        try {
+          const res = await adminFetch('/api/payments/pay', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionCode, paymentMethod: p.paymentMethod || 'QRIS' }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal melunasi');
+          ok.push(sessionCode);
+        } catch (err) {
+          failed.push(`${sessionCode}: ${errorText(err)}`);
+        }
+      }
+      return `${ok.length}/${codes.length} sesi lunas via ${p.paymentMethod || 'QRIS'}.${
+        failed.length ? ` Gagal: ${failed.join('; ')}` : ''
+      }`;
+    }
+    case 'open_gate': {
+      const res = await adminFetch('/api/admin/override', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          gateType: p.gateType,
+          zoneId: p.zoneId,
+          action: 'open',
+          reason: p.reason || 'Override darurat dari asisten operator',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal membuka gate');
+      return `Gate ${p.gateType} dibuka darurat${p.zoneId ? ` untuk zona ${p.zoneId}` : ''}.`;
     }
     default:
       throw new Error(`Aksi ${action.type} tidak didukung`);

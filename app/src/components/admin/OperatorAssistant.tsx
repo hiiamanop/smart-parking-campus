@@ -4,6 +4,7 @@ import {
   askVoice,
   applyAssistantAction,
   describeAssistantAction,
+  isDestructiveAction,
   startVoiceSession,
   type AssistantAction,
   type VoiceSession,
@@ -13,18 +14,41 @@ interface OperatorAssistantProps {
   onApplied: () => void;
 }
 
+interface ChatAction extends AssistantAction {
+  state?: 'pending' | 'applied' | 'dismissed';
+  note?: string;
+}
+
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
-  action?: AssistantAction | null;
-  actionState?: 'pending' | 'applied' | 'dismissed';
-  actionNote?: string;
+  actions?: ChatAction[];
+  createdAt?: number;
+}
+
+function toChatActions(actions: AssistantAction[] | undefined): ChatAction[] | undefined {
+  if (!actions || actions.length === 0) return undefined;
+  return actions.map((a) => ({ ...a, state: 'pending' }));
+}
+
+function clockLabel(ts?: number): string {
+  try {
+    return new Date(ts || Date.now()).toLocaleTimeString('id-ID', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return '';
+  }
 }
 
 const SUGGESTIONS = [
-  'Ringkasan parkir hari ini',
+  'Ringkas kondisi parkir hari ini dan beri rekomendasi',
   'Zona mana yang hampir penuh?',
-  'Sesi yang belum bayar?',
+  'Batalkan semua booking yang sudah kedaluwarsa',
+  'Sesi mana yang siap checkout dan belum dibayar?',
+  'Naikkan kapasitas semua zona motor sebesar 5',
+  'Buka gate masuk zona mana yang paling sibuk?',
 ];
 
 function renderInline(text: string) {
@@ -141,8 +165,13 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
   }, [voiceSession]);
 
   useEffect(() => {
-    if (!listRef.current) return;
-    listRef.current.scrollTop = listRef.current.scrollHeight;
+    const el = listRef.current;
+    if (!el) return;
+    if (messages.length === 0) {
+      el.scrollTop = 0;
+      return;
+    }
+    el.scrollTop = el.scrollHeight;
   }, [messages, open, busy, voiceMode]);
 
   useEffect(() => {
@@ -233,12 +262,12 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
 
       setMessages((prev) => [
         ...prev,
-        { role: 'user', content: result.transcript },
+        { role: 'user', content: result.transcript, createdAt: Date.now() },
         {
           role: 'assistant',
           content: result.reply,
-          action: result.action,
-          actionState: result.action ? 'pending' : undefined,
+          actions: toChatActions(result.actions.length ? result.actions : result.action ? [result.action] : []),
+          createdAt: Date.now(),
         },
       ]);
 
@@ -326,7 +355,7 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
   const send = async (text?: string) => {
     const content = (text ?? input).trim();
     if (!content || busy) return;
-    const next = [...messages, { role: 'user' as const, content }];
+    const next = [...messages, { role: 'user' as const, content, createdAt: Date.now() }];
     setMessages(next);
     setInput('');
     setBusy(true);
@@ -341,8 +370,8 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
         {
           role: 'assistant',
           content: reply.reply,
-          action: reply.action,
-          actionState: reply.action ? 'pending' : undefined,
+          actions: toChatActions(reply.actions.length ? reply.actions : reply.action ? [reply.action] : []),
+          createdAt: Date.now(),
         },
       ]);
     } catch (err) {
@@ -352,28 +381,66 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
     }
   };
 
-  const resolveAction = async (index: number, approve: boolean) => {
-    const target = messages[index];
-    if (!target?.action) return;
+  const updateAction = (
+    messageIndex: number,
+    actionIndex: number,
+    patch: Partial<ChatAction>
+  ) => {
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i === messageIndex
+          ? {
+              ...m,
+              actions: m.actions?.map((a, j) => (j === actionIndex ? { ...a, ...patch } : a)),
+            }
+          : m
+      )
+    );
+  };
+
+  const resolveAction = async (messageIndex: number, actionIndex: number, approve: boolean) => {
+    const target = messages[messageIndex]?.actions?.[actionIndex];
+    if (!target) return;
     if (!approve) {
-      setMessages((prev) =>
-        prev.map((m, i) => (i === index ? { ...m, actionState: 'dismissed' } : m))
-      );
+      updateAction(messageIndex, actionIndex, { state: 'dismissed' });
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const note = await applyAssistantAction(target.action);
-      setMessages((prev) =>
-        prev.map((m, i) => (i === index ? { ...m, actionState: 'applied', actionNote: note } : m))
-      );
+      const note = await applyAssistantAction(target);
+      updateAction(messageIndex, actionIndex, { state: 'applied', note });
       onApplied();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
+  };
+
+  // Apply every pending action on one message in order (useful when the
+  // assistant proposes a sequence such as "delete zone, then delete domain").
+  const applyAll = async (messageIndex: number) => {
+    const pending = (messages[messageIndex]?.actions || [])
+      .map((a, i) => ({ a, i }))
+      .filter((x) => x.a.state === 'pending');
+    if (!pending.length) return;
+    setBusy(true);
+    setError(null);
+    let applied = 0;
+    for (const { a, i } of pending) {
+      try {
+        const note = await applyAssistantAction(a);
+        updateAction(messageIndex, i, { state: 'applied', note });
+        applied += 1;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setError(`Aksi "${describeAssistantAction(a)}" gagal: ${message}`);
+        break;
+      }
+    }
+    if (applied) onApplied();
+    setBusy(false);
   };
 
   const voiceTimerText = `${Math.floor(voiceRemaining / 60)}:${String(voiceRemaining % 60).padStart(2, '0')}`;
@@ -393,9 +460,18 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
       {open && (
         <section className="operator-panel no-print" aria-label="Asisten operator">
           <header className="operator-head">
-            <div>
-              <strong>Asisten operator</strong>
-              <span className="operator-sub">Baca data &amp; usulkan perubahan</span>
+            <div className="operator-identity">
+              <span className="operator-avatar operator-avatar-head">
+                <img src="/logo-ganesha-chatbot.png" alt="" />
+              </span>
+              <div className="operator-head-text">
+                <strong>
+                  Nusa <span className="operator-role">Asisten operator</span>
+                </strong>
+                <span className="operator-sub">
+                  <span className="operator-online" /> Online · siap membantu operasional
+                </span>
+              </div>
             </div>
             <div className="operator-head-actions">
               {!voiceMode ? (
@@ -457,9 +533,17 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
           <div className="operator-messages" ref={listRef}>
             {messages.length === 0 && (
               <div className="operator-empty">
-                <p>Minta ringkasan data, cari sesi, atau minta perubahan zona/domain.</p>
-                <p className="hint-text">
-                  Perubahan data tidak langsung dijalankan — Anda menyetujuinya dulu.
+                <span className="operator-avatar operator-avatar-hero">
+                  <img src="/logo-ganesha-chatbot.png" alt="" />
+                </span>
+                <h3 className="operator-empty-title">Halo, saya Nusa 👋</h3>
+                <p>
+                  Copilot operasional parkir kampus Anda. Tanya kondisi live, minta analisis,
+                  atau minta perubahan data sekaligus — termasuk aksi massal.
+                </p>
+                <p className="operator-empty-note">
+                  Semua perubahan, terutama hapus dan pembayaran, baru dijalankan setelah Anda
+                  meninjau lalu menekan <strong>Terapkan</strong>.
                 </p>
                 <div className="operator-suggestions">
                   {SUGGESTIONS.map((s) => (
@@ -471,66 +555,128 @@ export function OperatorAssistant({ onApplied }: OperatorAssistantProps) {
               </div>
             )}
 
-            {messages.map((m, i) => (
-              <div key={i} className={`operator-msg ${m.role}`}>
-                <div className="operator-bubble"><MessageBody text={m.content} /></div>
-                {m.action && (
-                  <div className={`operator-action ${m.actionState ?? 'pending'}`}>
-                    <span className="operator-action-title">{describeAssistantAction(m.action)}</span>
-                    {m.actionState === 'pending' && (
-                      <div className="operator-action-row">
-                        <button
-                          type="button"
-                          className="btn btn-primary btn-sm"
-                          onClick={() => resolveAction(i, true)}
-                          disabled={busy}
+            {messages.map((m, i) => {
+              const pendingCount = (m.actions || []).filter((a) => a.state === 'pending').length;
+              return (
+                <div key={i} className={`operator-row ${m.role}`}>
+                  {m.role === 'assistant' && (
+                    <span className="operator-avatar operator-avatar-msg">
+                      <img src="/logo-ganesha-chatbot.png" alt="" />
+                    </span>
+                  )}
+                  <div className="operator-col">
+                    <div className="operator-bubble"><MessageBody text={m.content} /></div>
+                    {m.actions?.map((action, ai) => {
+                      const destructive = isDestructiveAction(action);
+                      return (
+                        <div
+                          key={ai}
+                          className={`operator-action ${action.state ?? 'pending'} ${destructive ? 'destructive' : ''}`}
                         >
-                          Terapkan
-                        </button>
-                        <button
-                          type="button"
-                          className="secondary btn-sm"
-                          onClick={() => resolveAction(i, false)}
-                          disabled={busy}
-                        >
-                          Batal
-                        </button>
-                      </div>
+                          <span className="operator-action-title">{describeAssistantAction(action)}</span>
+                          {destructive && (
+                            <span className="operator-action-warn">
+                              Aksi berisiko — tinjau dampaknya sebelum menyetujui.
+                            </span>
+                          )}
+                          {action.state === 'pending' && (
+                            <div className="operator-action-row">
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-sm"
+                                onClick={() => resolveAction(i, ai, true)}
+                                disabled={busy}
+                              >
+                                {destructive ? 'Setujui & terapkan' : 'Terapkan'}
+                              </button>
+                              <button
+                                type="button"
+                                className="secondary btn-sm"
+                                onClick={() => resolveAction(i, ai, false)}
+                                disabled={busy}
+                              >
+                                Batal
+                              </button>
+                            </div>
+                          )}
+                          {action.state === 'applied' && (
+                            <span className="operator-action-note ok">{action.note}</span>
+                          )}
+                          {action.state === 'dismissed' && (
+                            <span className="operator-action-note">Dibatalkan.</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {pendingCount > 1 && (
+                      <button
+                        type="button"
+                        className="secondary btn-sm operator-apply-all"
+                        onClick={() => applyAll(i)}
+                        disabled={busy}
+                      >
+                        Terapkan semua ({pendingCount})
+                      </button>
                     )}
-                    {m.actionState === 'applied' && (
-                      <span className="operator-action-note ok">{m.actionNote}</span>
-                    )}
-                    {m.actionState === 'dismissed' && (
-                      <span className="operator-action-note">Dibatalkan.</span>
-                    )}
+                    <span className="operator-meta">
+                      {m.role === 'user' ? 'Anda' : 'Nusa'} · {clockLabel(m.createdAt)}
+                    </span>
                   </div>
-                )}
-              </div>
-            ))}
+                  {m.role === 'user' && (
+                    <span className="operator-avatar operator-avatar-msg operator-avatar-user">A</span>
+                  )}
+                </div>
+              );
+            })}
 
-            {busy && <div className="operator-typing">Asisten sedang mengetik…</div>}
-            {voiceBusy && <div className="operator-typing">Memproses suara…</div>}
+            {busy && (
+              <div className="operator-row assistant">
+                <span className="operator-avatar operator-avatar-msg">
+                  <img src="/logo-ganesha-chatbot.png" alt="" />
+                </span>
+                <div className="operator-typing" aria-label="Asisten sedang mengetik">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              </div>
+            )}
+            {voiceBusy && <div className="operator-typing-note">Memproses suara…</div>}
             {error && <div className="alert alert-err">{error}</div>}
             {voiceError && <div className="alert alert-err">{voiceError}</div>}
           </div>
 
           <form
-            className="operator-input"
+            className="operator-composer"
             onSubmit={(e) => {
               e.preventDefault();
               send();
             }}
           >
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Tanya data atau minta perubahan…"
-              disabled={busy}
-            />
-            <button type="submit" className="btn btn-primary btn-sm" disabled={busy || !input.trim()}>
-              Kirim
-            </button>
+            <div className="operator-input">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Tanya data atau minta perubahan…"
+                disabled={busy}
+              />
+              <button
+                type="submit"
+                className="operator-send"
+                disabled={busy || !input.trim()}
+                aria-label="Kirim pesan"
+                title="Kirim"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M22 2 11 13" />
+                  <path d="M22 2 15 22l-4-9-9-4Z" />
+                </svg>
+              </button>
+            </div>
+            <span className="operator-composer-hint">
+              Data live · perubahan data menunggu persetujuan Anda
+            </span>
           </form>
         </section>
       )}

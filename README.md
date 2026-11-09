@@ -19,12 +19,12 @@ Browser (driver / admin / gate)
    ▼
 smart-parking-api (Node http, :8788)
    ├─ Redis      sesi, master data, counter kuota, event, statistik
-   ├─ vLLM lokal VLM plat nomor (OpenAI-compatible)
+   ├─ OpenRouter Claude Haiku 5.5: VLM plat nomor (multimodal)
    └─ OpenRouter asisten operator + voice (STT/TTS)
 ```
 
 - API key OpenRouter hanya di server.
-- VLM plat nomor dilayani vLLM lokal agar banyak kamera/gate bisa membaca plat paralel.
+- VLM plat nomor dan asisten operator sama-sama memakai Claude Haiku 5.5 lewat OpenRouter.
 - Live update memakai Redis Pub/Sub → SSE `/api/events` (semua app + browser).
 
 ## Alur utama
@@ -100,19 +100,17 @@ OPENROUTER_API_KEY=sk-or-...
 REDIS_URL=redis://127.0.0.1:6379
 
 # Asisten operator + voice (STT/TTS) via OpenRouter
-OPENROUTER_ASSISTANT_MODEL=deepseek/deepseek-v4-flash
+OPENROUTER_ASSISTANT_MODEL=anthropic/claude-haiku-5.5
 OPENROUTER_STT_MODEL=openai/gpt-audio
 OPENROUTER_TTS_MODEL=openai/gpt-audio
 OPENROUTER_TTS_VOICE=nova
 VOICE_MAX_SECONDS=120
 
-# VLM plat nomor: server lokal OpenAI-compatible (vLLM)
-# Default: Qwen3-VL-8B-Instruct-AWQ-4bit (muat di GPU 12 GB).
-VLM_PROVIDER=vllm
-VLLM_BASE_URL=http://host.docker.internal:8001/v1
-VLLM_MODEL=qwen3-vl-8b-awq
-VLLM_API_KEY=
-VLM_TIMEOUT_MS=90000
+# VLM plat nomor + asisten operator: Claude Haiku 5.5 via OpenRouter
+OPENROUTER_VLM_MODEL=anthropic/claude-haiku-5.5
+VLM_PROVIDER=openrouter
+VLM_TIMEOUT_MS=60000
+ASSISTANT_TIMEOUT_MS=60000
 # Kuota VLM per menit. Dihitung per gate (header x-gate-id), lalu token, lalu IP.
 VLM_RATE_LIMIT=120
 
@@ -128,46 +126,31 @@ SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_TABLE=parking_history
 ```
 
-## vLLM lokal (pembacaan plat)
+## Model VLM & asisten operator
 
-Pembacaan plat memakai VLM lokal lewat vLLM (OpenAI-compatible) supaya banyak
-kamera/gate bisa mengirim gambar paralel tanpa rate limit OpenRouter.
+VLM plat nomor dan "otak" asisten operator sama-sama memakai **Claude Haiku 5.5**
+(`anthropic/claude-haiku-5.5`) lewat OpenRouter.
 
-Default di repo ini: **Qwen3-VL-8B-Instruct-AWQ-4bit** (~7,6 GB). Model 12B
-AWQ (mis. Gemma 4 12B, ~11,25 GB) tidak muat di RTX 3060 12 GB bersama KV cache.
+- `OPENROUTER_VLM_MODEL` untuk OCR plat nomor (input gambar).
+- `OPENROUTER_ASSISTANT_MODEL` untuk asisten operator (percakapan + perencanaan aksi).
+- API key hanya ada di server; browser tidak pernah menerima key.
+- Cek kesiapan: `curl -s http://127.0.0.1:8788/api/vlm/status` dan
+  `POST /api/admin/assistant`.
 
-```bash
-# 1) Siapkan environment (sekali saja)
-cd ~/workspace
-uv venv vllm-env --python 3.12
-uv pip install --python vllm-env/bin/python --torch-backend=auto vllm
-HF_HOME=~/workspace/hf-cache uvx --from 'huggingface_hub[cli]' \
-  hf download cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit \
-  --local-dir ~/workspace/models/qwen3-vl-8b-awq
+Asisten operator bisa:
 
-# 2) Jalankan server (port 8001, otomatis terbaca dari container)
-./deploy/start-vllm.sh
-```
+- membaca data live (zona, sesi, analitik, kualitas kamera, event terakhir);
+- mengusulkan satu atau banyak aksi sekaligus (maksimal 10 per balasan);
+- menjalankan aksi massal: batalkan/reissue/checkout/bayar banyak sesi, ubah banyak
+  zona, hapus banyak zona/domain;
+- mengusulkan aksi berisiko (hapus, bayar, buka gate darurat) yang **selalu**
+  menunggu persetujuan operator di kartu aksi.
 
-Cek kesiapan:
+### Kembali ke vLLM lokal (opsional)
 
-```bash
-curl -s http://<ip-host>:8001/v1/models
-curl -s http://127.0.0.1:8788/api/vlm/status
-```
-
-`deploy/start-vllm.sh` memakai `--gpu-memory-utilization 0.90`, `--max-model-len 6144`,
-`--max-num-seqs 8`, dan menonaktifkan JIT flashinfer (host tanpa nvcc).
-
-Auto-start saat boot (systemd user, `Linger=yes`):
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp deploy/vllm-plate.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now vllm-plate.service
-systemctl --user status vllm-plate.service
-```
+Script `deploy/start-vllm.sh` dan `deploy/vllm-plate.service` tetap disimpan untuk
+deployment offline. Set `VLM_PROVIDER=vllm`, isi `VLLM_BASE_URL` dan `VLLM_MODEL`,
+lalu jalankan service. Konfigurasi default repo tidak memakai jalur ini.
 
 ## Build, tes, deploy
 
@@ -222,5 +205,6 @@ docs/       BRD, user story, backlog
 - Pembayaran QRIS masih simulasi (tanpa gateway).
 - Palang gate fisik belum diintegrasikan; status palang hanya di layar kiosk.
 - Identitas driver belum ada autentikasi (cukup nama pada booking).
-- Asisten operator memakai DeepSeek V4 Flash (terpisah dari VLM); perubahan data selalu perlu persetujuan operator di UI, termasuk aksi bulk.
-- VLM plat nomor memakai vLLM lokal (OpenAI-compatible) agar tahan banyak input paralel; tanpa server vLLM, pembacaan plat akan gagal dengan pesan yang jelas.
+- Asisten operator dan VLM plat nomor sama-sama memakai Claude Haiku 5.5 lewat OpenRouter; perubahan data selalu perlu persetujuan operator di UI, termasuk aksi bulk dan hapus.
+- Asisten bisa mengusulkan maksimal 10 aksi per balasan dan memuat hingga 150 sesi aktif dalam snapshot; untuk data lebih besar, persempit filter.
+- Pembacaan plat bergantung pada kuota/koneksi OpenRouter; tidak ada lagi server VLM lokal secara default.
