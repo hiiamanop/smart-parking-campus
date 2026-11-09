@@ -44,6 +44,24 @@ function gateFetch(input: string, init: RequestInit = {}): Promise<Response> {
 
 const API_BASE = typeof window !== 'undefined' && window.location.port === '5175' ? 'http://127.0.0.1:8788' : '';
 
+type GateMode = 'entry' | 'exit';
+
+// QR codes are self-describing: entry tickets use SP-..., exit passes use OUT-....
+// The QR type must win over the manually selected kiosk mode. Otherwise an exit
+// QR scanned while the kiosk is on "Gate Masuk" is sent to /api/gates/entry and
+// the API answers "Sesi parkir tidak ditemukan" (it looks up the OUT- code as a
+// session code).
+export function modeFromCode(code: string): GateMode | null {
+  if (!code) return null;
+  if (/^OUT-/i.test(code)) return 'exit';
+  if (/^SP-/i.test(code)) return 'entry';
+  return null;
+}
+
+export function resolveGateMode(code: string, selected: GateMode): GateMode {
+  return modeFromCode(code) || selected;
+}
+
 export function App() {
   const [gateMode, setGateMode] = useState<'entry' | 'exit'>('entry');
   const [currentStep, setCurrentStep] = useState<PipelineStep>('1_SCANNING_QR');
@@ -67,6 +85,9 @@ export function App() {
   const [liveEvent, setLiveEvent] = useState<string>('Menunggu event...');
 
   const resetPipelineRef = useRef<() => void>(() => {});
+  // The camera scan loop is created once, so it must call the latest handler
+  // instead of the handler captured on the first render (stale gateMode bug).
+  const onQrCodeDetectedRef = useRef<(raw: string, image?: string) => void>(() => {});
 
   // Automated workflow state
   const [detectedQrCode, setDetectedQrCode] = useState<string | null>(null);
@@ -409,8 +430,13 @@ export function App() {
     setStatusText(`Menyimpan plat ${plateText} ke sesi...`);
     setErrorText(null);
 
+    // Route by the QR type, not the manual toggle. An OUT- pass must always
+    // hit the exit endpoint even when the kiosk is left on "Gate Masuk".
+    const effectiveMode = resolveGateMode(code, gateMode);
+    if (effectiveMode !== gateMode) setGateMode(effectiveMode);
+
     try {
-      if (gateMode === 'entry') {
+      if (effectiveMode === 'entry') {
         const res = await gateFetch(`${API_BASE}/api/gates/entry`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -504,6 +530,10 @@ export function App() {
     const clean = extractCode(rawCode);
     setDetectedQrCode(clean);
 
+    // Keep the kiosk pill/banner in sync with the QR actually scanned.
+    const codeMode = modeFromCode(clean);
+    if (codeMode) setGateMode(codeMode);
+
     if (providedImage) {
       // Dari upload foto: langsung kirim gambar itu ke VLM
       setSnapshotDataUrl(providedImage);
@@ -515,6 +545,11 @@ export function App() {
     // Dari kamera live: standby sampai plat benar-benar terbaca
     startPlateStandby(clean);
   };
+
+  // Always point the one-time scan loop at the latest detector handler.
+  useEffect(() => {
+    onQrCodeDetectedRef.current = onQrCodeDetected;
+  });
 
   // Continuous Camera Scanning Loop for QR code
   useEffect(() => {
@@ -542,7 +577,7 @@ export function App() {
           });
 
           if (qr && qr.data && qr.data.trim()) {
-            onQrCodeDetected(qr.data);
+            onQrCodeDetectedRef.current(qr.data);
           }
         }
       }

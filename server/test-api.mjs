@@ -123,6 +123,22 @@ async function runApiTest() {
   assert.equal(exitRes.data.gateOpened, true);
   assert.equal(exitRes.data.session.status, 'COMPLETED');
 
+  // 8b. Wrong QR type at the wrong gate must explain itself instead of the
+  // misleading "Sesi parkir tidak ditemukan" the kiosk used to show.
+  const exitQrAtEntry = await request('/api/gates/entry', {
+    method: 'POST',
+    body: JSON.stringify({ sessionCode: 'OUT-DEADBEEF00000001', manualPlateOverride: 'B 4321 OK' }),
+  });
+  assert.equal(exitQrAtEntry.status, 400);
+  assert.match(String(exitQrAtEntry.data.error), /QR keluar|Gate Keluar/i);
+
+  const entryQrAtExit = await request('/api/gates/exit', {
+    method: 'POST',
+    body: JSON.stringify({ exitCode: 'SP-DEADBEEF00000001', manualPlateOverride: 'B 4321 OK' }),
+  });
+  assert.equal(entryQrAtExit.status, 400);
+  assert.match(String(entryQrAtExit.data.error), /QR tiket masuk/i);
+
   // 9. Cancel booking releases the slot
   const cancelBook = await request('/api/bookings', {
     method: 'POST',

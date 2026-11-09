@@ -656,7 +656,16 @@ export async function saveSession(session) {
 // Gate In entry processing
 async function processGateInInner({ sessionCode, plateRead, manualPlateOverride }) {
   const session = await getSession(sessionCode);
-  if (!session) throw new Error('Sesi parkir tidak ditemukan');
+  if (!session) {
+    // A gate that scanned an OUT- pass while in entry mode must say so, instead
+    // of the misleading "session not found" (the OUT- code is not a session).
+    if (/^OUT-/i.test(String(sessionCode))) {
+      throw new Error(
+        'Ini QR keluar (OUT-…), bukan QR tiket masuk (SP-…). Pindai QR tiket masuk atau pilih mode Gate Keluar.'
+      );
+    }
+    throw new Error('Sesi parkir tidak ditemukan');
+  }
 
   if (session.status === 'EXPIRED') {
     throw new Error('QR masuk sudah kedaluwarsa (15 menit sejak ETA). Silakan booking ulang.');
@@ -1157,8 +1166,18 @@ export async function processPayment(args) {
 }
 
 export async function processGateOut(args) {
-  const sessionCode = await redis.get(`parking:exit:${args.exitCode}`);
-  if (!sessionCode) throw new Error('QR/Kode keluar tidak valid atau sudah kedaluwarsa');
+  const exitCode = String(args.exitCode || '');
+  const sessionCode = await redis.get(`parking:exit:${exitCode}`);
+  if (!sessionCode) {
+    // Scanning an entry ticket at the exit gate is a common mistake; point the
+    // driver at the QR they actually need instead of a generic error.
+    if (/^SP-/i.test(exitCode)) {
+      throw new Error(
+        'Ini QR tiket masuk (SP-…), bukan QR keluar (OUT-…). Selesaikan pembayaran lalu pindai QR keluar dari aplikasi.'
+      );
+    }
+    throw new Error('QR/Kode keluar tidak valid atau sudah kedaluwarsa');
+  }
   return withSessionLock(sessionCode, () => processGateOutInner(args));
 }
 
