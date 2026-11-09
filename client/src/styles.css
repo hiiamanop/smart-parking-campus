@@ -452,6 +452,37 @@ button { font: inherit; }
   border-color: var(--navy);
   box-shadow: 0 0 0 3px rgba(0, 46, 93, 0.08);
 }
+.time-field {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 2px;
+  width: 100%;
+  max-width: 100%;
+  margin-top: 6px;
+  padding: 4px 8px 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+}
+.time-field:focus-within {
+  border-color: var(--navy);
+  box-shadow: 0 0 0 3px rgba(0, 46, 93, 0.08);
+}
+.time-select {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 96px;
+  border: none;
+  background: transparent;
+  padding: 6px 2px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.time-select:focus { outline: none; }
+.time-colon { font-size: 14px; font-weight: 650; color: var(--muted); }
 .field-hint { font-size: 11.5px; color: var(--faint); line-height: 1.45; margin-top: 6px; }
 
 /* ------------------------------------------------------------------ */

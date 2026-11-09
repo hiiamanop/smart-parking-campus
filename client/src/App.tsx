@@ -583,12 +583,33 @@ function ExploreView({
 
             <label className="field-label">
               Perkiraan waktu tiba
-              <input
-                type="time"
-                value={etaTime}
-                onChange={(e) => setEtaTime(e.target.value)}
-                className="time-input"
-              />
+              <div className="time-field">
+                <select
+                  className="time-select"
+                  aria-label="Jam tiba"
+                  value={etaTime.slice(0, 2)}
+                  onChange={(e) => setEtaTime(`${e.target.value}:${etaTime.slice(3, 5)}`)}
+                >
+                  {Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0')).map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+                <span className="time-colon">:</span>
+                <select
+                  className="time-select"
+                  aria-label="Menit tiba"
+                  value={etaTime.slice(3, 5)}
+                  onChange={(e) => setEtaTime(`${etaTime.slice(0, 2)}:${e.target.value}`)}
+                >
+                  {Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')).map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </label>
             <p className="field-hint">
               Plat nomor tidak perlu diisi. Kamera gate membaca plat otomatis saat kendaraan tiba.
