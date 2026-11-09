@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import jsQR from 'jsqr';
-import { loadPlateDetector, getDetectorSession, detectPlate, cropPlate, type PlateBox, loadPlateRecognizer, getRecognizerSession, recognizePlate } from './plateDetector';
 
 type PipelineStep = '1_SCANNING_QR' | '2_READING_PLATE_VLM' | '3_SAVING_OPENING' | '4_GATE_OPENED';
 
@@ -67,19 +66,7 @@ export function App() {
   const [redisLive, setRedisLive] = useState(false);
   const [liveEvent, setLiveEvent] = useState<string>('Menunggu event...');
 
-  // On-device plate detector (ONNX) state
-  const [detectorReady, setDetectorReady] = useState(false);
-  const [detectorLoading, setDetectorLoading] = useState(false);
-  const [detectorError, setDetectorError] = useState<string | null>(null);
-  const detectorSessionRef = useRef<any>(null);
-  const consecutiveDetectRef = useRef(0);
   const resetPipelineRef = useRef<() => void>(() => {});
-
-  // OCR lokal (recognizer) state
-  const [recognizerReady, setRecognizerReady] = useState(false);
-  const [recognizerLoading, setRecognizerLoading] = useState(false);
-  const [recognizerError, setRecognizerError] = useState<string | null>(null);
-  const recognizerSessionRef = useRef<any>(null);
 
   // Automated workflow state
   const [detectedQrCode, setDetectedQrCode] = useState<string | null>(null);
@@ -104,9 +91,6 @@ export function App() {
   const [pendingCode, setPendingCode] = useState<string | null>(null);
   const standbyRef = useRef<{ cancelled: boolean; timer: number }>({ cancelled: false, timer: 0 });
 
-  const STANDBY_FRAME_MS = 900;   // jeda antar frame
-  const FRAMES_PER_SEND = 3;      // kirim frame terbaik tiap ~3 frame
-  const MAX_VLM_ATTEMPTS = 3;     // batas panggilan konsensus per scan (biaya VLM)
   const MIN_SHARPNESS = 6;        // frame terlalu blur tidak dikirim
 
   // Ambil frame dari video + ukur ketajaman (Laplacian variance)
@@ -178,58 +162,17 @@ export function App() {
     setPlateStandby(false);
   }, []);
 
-  // Ambil beberapa frame berurutan dari kamera untuk konsensus OCR.
-  // Bila `box` tersedia, frame lanjutan di-crop ulang di area plat (dengan
-  // re-deteksi ringan) supaya VLM hanya menerima gambar plat, bukan frame penuh.
-  const captureBurst = async (
-    firstDataUrl: string,
-    count = 3,
-    gapMs = 320,
-    box?: PlateBox
-  ): Promise<string[]> => {
-    const frames = [firstDataUrl];
-    for (let i = 1; i < count; i += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((resolve) => setTimeout(resolve, gapMs));
-      const video = videoRef.current;
-      let next = '';
-
-      if (box && video && video.readyState >= 2) {
-        let nextBox = box;
-        const sess = detectorSessionRef.current;
-        if (sess) {
-          try {
-            const fresh = await detectPlate(sess, video, 0.4);
-            if (fresh) nextBox = fresh;
-          } catch {
-            // keep the previous box
-          }
-        }
-        next = cropPlate(video, nextBox);
-      }
-
-      // Fallback ke frame penuh bila crop gagal / tidak ada box.
-      if (!next) next = grabFrame().dataUrl;
-      if (next) frames.push(next);
-    }
-    return frames;
-  };
-
-  // Kirim beberapa frame sekaligus, server memutuskan lewat konsensus
-  const requestConsensus = async (frames: string[]): Promise<{
+  // Satu frame, satu bacaan. Server menerima plat valid langsung tanpa
+  // menunggu frame kedua/ketiga.
+  const requestPlateRead = async (dataUrl: string): Promise<{
     plate: string | null;
     accepted: boolean;
     confidence: number;
-    votes: number;
-    total: number;
-    candidates: Array<{ plate: string; votes: number; confidence: number }>;
     reason?: string;
     error?: string;
   }> => {
-    const payload = frames.map((dataUrl) => {
-      const m = dataUrl.match(/^data:(.*?);base64,(.*)$/);
-      return { mimeType: m?.[1] || 'image/jpeg', imageBase64: m?.[2] || dataUrl };
-    });
+    const m = dataUrl.match(/^data:(.*?);base64,(.*)$/);
+    const payload = [{ mimeType: m?.[1] || 'image/jpeg', imageBase64: m?.[2] || dataUrl }];
     try {
       const res = await gateFetch(`${API_BASE}/api/vlm/plate/consensus`, {
         method: 'POST',
@@ -239,11 +182,11 @@ export function App() {
       if (res.status === 401 || res.status === 403) setGateAuthRequired(true);
       const data = await res.json();
       if (!res.ok || !data.ok) {
-        return { plate: null, accepted: false, confidence: 0, votes: 0, total: frames.length, candidates: [], error: data?.error };
+        return { plate: null, accepted: false, confidence: 0, error: data?.error };
       }
       return data;
     } catch (err: any) {
-      return { plate: null, accepted: false, confidence: 0, votes: 0, total: frames.length, candidates: [], error: err?.message };
+      return { plate: null, accepted: false, confidence: 0, error: err?.message };
     }
   };
 
@@ -279,45 +222,18 @@ export function App() {
     setStatusText('QR terverifikasi. Arahkan plat nomor ke kamera — AI standby menunggu plat terbaca...');
 
     standbyRef.current = { cancelled: false, timer: 0 };
-    consecutiveDetectRef.current = 0;
-    let attempt = 0;
-    let frames = 0;
-    let best: { dataUrl: string; sharpness: number } = { dataUrl: '', sharpness: -1 };
 
     const schedule = (ms: number) => {
       standbyRef.current.timer = window.setTimeout(tick, ms);
     };
 
-    const trySend = async (dataUrl: string, box?: PlateBox): Promise<boolean> => {
-      attempt++;
-      setPlateAttempt(attempt);
+    const trySend = async (dataUrl: string): Promise<boolean> => {
+      setPlateAttempt((n) => n + 1);
 
-      // 1) Coba OCR lokal dulu (tanpa VLM) bila model siap
-      const recSess = recognizerSessionRef.current;
-      if (recSess) {
-        try {
-          const rec = await recognizePlate(recSess, dataUrl, 0.35);
-          if (standbyRef.current.cancelled) return true;
-          if (rec && rec.text && rec.text.length >= 4 && rec.confidence >= 0.6) {
-            stopPlateStandby();
-            setSnapshotDataUrl(dataUrl);
-            setVlmPlate(rec.text);
-            await savePlateAndOpenGate(code, rec.text);
-            setStatusText(`PLAT ${rec.text} TERBACA LOKAL (conf ${Math.round(rec.confidence*100)}%). PALANG TERBUKA.`);
-            return true;
-          }
-          setStatusText(`OCR lokal: ${rec?.text || 'tidak ada'} (conf ${Math.round((rec?.confidence||0)*100)}%). Lanjut VLM...`);
-        } catch (e) {
-          // fall through to VLM
-        }
-      }
-
-      setPlateAttempt(attempt);
-      const burstSize = attempt === 1 ? 3 : 2;
-      setStatusText(`AI membaca ${burstSize} frame plat... percobaan ${attempt}/${MAX_VLM_ATTEMPTS}`);
+      // Langsung VLM: satu foto, satu bacaan. Plat valid langsung diproses.
+      setStatusText('AI membaca plat... hasil valid langsung membuka palang.');
       try {
-        const frames = await captureBurst(dataUrl, burstSize, 320, box);
-        const decision = await requestConsensus(frames);
+        const decision = await requestPlateRead(dataUrl);
         if (standbyRef.current.cancelled) return true;
 
         await reportImageQuality();
@@ -326,28 +242,16 @@ export function App() {
           stopPlateStandby();
           setSnapshotDataUrl(dataUrl);
           setVlmPlate(decision.plate);
+          setStatusText(`PLAT ${decision.plate} TERBACA. Membuka palang...`);
           await savePlateAndOpenGate(code, decision.plate);
-          setStatusText(
-            `KONSENSUS ${decision.votes}/${decision.total} FRAME: ${decision.plate} (conf ${Math.round(decision.confidence * 100)}%). PALANG TERBUKA.`
-          );
           return true;
         }
 
-        const candidates = (decision.candidates || []).map((c) => c.plate).filter(Boolean);
-        const candidateText = candidates.length ? ` Kandidat: ${candidates.slice(0, 3).join(', ')}.` : '';
-
-        if (attempt >= MAX_VLM_ATTEMPTS) {
-          setSnapshotDataUrl(dataUrl);
-          stopPlateStandby();
-          setStatusText('Standby plat dihentikan. Menunggu tindakan operator.');
-          setErrorText(
-            `Konsensus plat tidak tercapai setelah ${attempt} percobaan.${candidateText} ` +
-            'Pastikan plat terlihat jelas dan tidak blur, lalu tekan "Baca Plat Lagi" atau gunakan Upload Foto.'
-          );
-          return true;
-        }
-
-        setStatusText(`Konsensus lemah (${decision.votes || 0}/${decision.total} frame).${candidateText} Tetap standby...`);
+        setStatusText(
+          decision.plate
+            ? `Terbaca "${decision.plate}" tetapi format belum valid. Tetap memindai...`
+            : 'Plat belum terbaca. Arahkan plat nomor ke kamera...'
+        );
         return false;
       } catch (err: any) {
         if (standbyRef.current.cancelled) return true;
@@ -360,48 +264,27 @@ export function App() {
       if (standbyRef.current.cancelled) return;
       if (!videoRef.current || videoRef.current.readyState < 2) {
         setStatusText('Kamera belum siap — menunggu stream video...');
-        schedule(STANDBY_FRAME_MS);
+        schedule(200);
         return;
       }
 
-      frames++;
       const frame = grabFrame();
-      if (frame.dataUrl) lastMetricsRef.current = frame;
-      if (frame.dataUrl && frame.sharpness > best.sharpness) best = frame;
+      if (!frame.dataUrl) {
+        schedule(200);
+        return;
+      }
+      lastMetricsRef.current = frame;
 
-      // 1) On-device detector: bila plat terdeteksi stabil -> crop & kirim ke VLM
-      if (detectorSessionRef.current && frames % 2 === 0) {
-        try {
-          const box = await detectPlate(detectorSessionRef.current, videoRef.current, 0.4);
-          if (box) {
-            consecutiveDetectRef.current += 1;
-            setStatusText(`Plat terdeteksi (${Math.round(box.conf * 100)}%). Menstabilkan...`);
-            if (consecutiveDetectRef.current >= 2) {
-              const crop = cropPlate(videoRef.current, box);
-              if (crop) {
-                consecutiveDetectRef.current = 0;
-                const done = await trySend(crop, box);
-                if (done || standbyRef.current.cancelled) return;
-              }
-            }
-          } else {
-            consecutiveDetectRef.current = 0;
-          }
-        } catch (e) {
-          consecutiveDetectRef.current = 0;
-        }
+      // Jangan kirim frame yang terlalu blur; ambil frame berikutnya.
+      if (frame.sharpness < MIN_SHARPNESS) {
+        setStatusText('Menunggu gambar plat yang lebih tajam...');
+        schedule(200);
+        return;
       }
 
-      // 2) Fallback: kirim frame terbaik berkala bila detector belum siap / tidak mendeteksi
-      if (frames % FRAMES_PER_SEND === 0 && best.dataUrl && best.sharpness >= MIN_SHARPNESS) {
-        const shot = best.dataUrl;
-        best = { dataUrl: '', sharpness: -1 };
-        consecutiveDetectRef.current = 0;
-        const done = await trySend(shot);
-        if (done || standbyRef.current.cancelled) return;
-      }
-
-      schedule(STANDBY_FRAME_MS);
+      const done = await trySend(frame.dataUrl);
+      if (done || standbyRef.current.cancelled) return;
+      schedule(250);
     };
 
     schedule(300);
@@ -511,30 +394,6 @@ export function App() {
     return () => sse.close();
   }, []);
 
-  // Muat model deteksi plat (ONNX) di background
-  useEffect(() => {
-    let cancelled = false;
-    setDetectorLoading(true);
-    setRecognizerLoading(true);
-    Promise.all([loadPlateDetector(), loadPlateRecognizer()])
-      .then(([detSess, recSess]) => {
-        if (cancelled) return;
-        if (detSess) { detectorSessionRef.current = detSess; setDetectorReady(true); setDetectorError(null); }
-        else setDetectorError('Model deteksi plat gagal dimuat. Tetap pakai mode VLM langsung.');
-        if (recSess) { recognizerSessionRef.current = recSess; setRecognizerReady(true); setRecognizerError(null); }
-        else setRecognizerError('Model OCR plat gagal dimuat. VLM tetap dipakai sebagai fallback.');
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setDetectorError(`Model deteksi plat error: ${e?.message || e}`);
-        setRecognizerError(`Model OCR plat error: ${e?.message || e}`);
-      })
-      .finally(() => {
-        if (!cancelled) { setDetectorLoading(false); setRecognizerLoading(false); }
-      });
-    return () => { cancelled = true; };
-  }, []);
-
   // Clean code extraction helper (handles e.g. "SP-A1B2", "#SP-A1B2", "OUT-7C1D", JSON, URL)
   const extractCode = (raw: string): string => {
     if (!raw) return '';
@@ -609,7 +468,7 @@ export function App() {
     setErrorText(null);
 
     try {
-      const decision = await requestConsensus([snapshotBase64]);
+      const decision = await requestPlateRead(snapshotBase64);
       await reportImageQuality();
       if (decision.error) throw new Error(decision.error);
 
@@ -617,11 +476,9 @@ export function App() {
         throw new Error('Plat nomor tidak terbaca oleh AI VLM. Pastikan plat berada di depan kamera.');
       }
       if (!decision.accepted) {
-        const candidates = (decision.candidates || []).map((c) => c.plate).filter(Boolean);
         throw new Error(
-          `Konsensus belum kuat (conf ${Math.round((decision.confidence || 0) * 100)}%).` +
-          (candidates.length ? ` Kandidat: ${candidates.slice(0, 3).join(', ')}.` : '') +
-          ' Gunakan standby kamera atau upload foto yang lebih jelas.'
+          `Plat terbaca "${decision.plate}" tetapi format belum valid. ` +
+          'Gunakan foto yang lebih jelas atau ulangi pemindaian.'
         );
       }
 
@@ -701,7 +558,6 @@ export function App() {
   const resetPipeline = () => {
     stopPlateStandby();
     isProcessingRef.current = false;
-    consecutiveDetectRef.current = 0;
     setVlmPlate(null);
     setSnapshotDataUrl(null);
     setGateOpen(false);
@@ -854,7 +710,7 @@ export function App() {
             {vlmPlate
               ? `✓ Plat: ${vlmPlate}`
               : plateStandby
-              ? `2. Standby plat… (${plateAttempt}/${MAX_VLM_ATTEMPTS})`
+              ? `2. Standby plat… (${plateAttempt} bacaan)`
               : '2. AI VLM Baca Plat'}
           </div>
         </div>
@@ -992,7 +848,7 @@ export function App() {
           </label>
         </div>
         <div className="detector-status">
-          Deteksi plat on-device: {detectorLoading ? 'memuat model...' : detectorReady ? 'siap (ONNX)' : detectorError || 'tidak aktif'} · OCR lokal: {recognizerLoading ? 'memuat...' : recognizerReady ? 'siap' : recognizerError || 'tidak aktif'}
+          Pembacaan plat: VLM langsung dari frame kamera · tanpa model ONNX
         </div>
       </div>
     </div>

@@ -29,8 +29,8 @@ assert.ok(split.candidates.length >= 2);
 // Single strong reading is accepted
 assert.equal(consensusPlate([{ plate: 'B 1234 ABC', confidence: 0.9 }]).accepted, true);
 
-// Single weak reading is rejected
-assert.equal(consensusPlate([{ plate: 'B 1234 ABC', confidence: 0.4 }]).accepted, false);
+// any readable single frame is accepted (gate opens on first valid read)
+assert.equal(consensusPlate([{ plate: 'B 1234 ABC', confidence: 0.4 }]).accepted, true);
 
 // Unreadable frames
 const empty = consensusPlate([{ plate: null }, { plate: null }]);

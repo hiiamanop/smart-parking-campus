@@ -106,8 +106,8 @@ OPENROUTER_TTS_MODEL=openai/gpt-audio
 OPENROUTER_TTS_VOICE=nova
 VOICE_MAX_SECONDS=120
 
-# VLM plat nomor + asisten operator: Claude Haiku 5.5 via OpenRouter
-OPENROUTER_VLM_MODEL=anthropic/claude-haiku-5.5
+# VLM plat nomor: Gemini 2.5 Flash (vision) via OpenRouter
+OPENROUTER_VLM_MODEL=google/gemini-2.5-flash
 VLM_PROVIDER=openrouter
 VLM_TIMEOUT_MS=60000
 ASSISTANT_TIMEOUT_MS=60000
@@ -128,8 +128,9 @@ SUPABASE_TABLE=parking_history
 
 ## Model VLM & asisten operator
 
-VLM plat nomor dan "otak" asisten operator sama-sama memakai **Claude Haiku 5.5**
-(`anthropic/claude-haiku-5.5`) lewat OpenRouter.
+VLM plat nomor memakai **Gemini 2.5 Flash** (`google/gemini-2.5-flash`), model
+vision yang cepat untuk OCR gambar. Asisten operator tetap memakai **Claude
+Haiku 5.5** (`anthropic/claude-haiku-5.5`) lewat OpenRouter.
 
 - `OPENROUTER_VLM_MODEL` untuk OCR plat nomor (input gambar).
 - `OPENROUTER_ASSISTANT_MODEL` untuk asisten operator (percakapan + perencanaan aksi).

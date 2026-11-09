@@ -45,7 +45,7 @@ const PORT = Number(process.env.VLM_PROXY_PORT || 8788);
 const HOST = process.env.VLM_PROXY_HOST || '127.0.0.1';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const OPENROUTER_BASE_URL = (process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
-const OPENROUTER_MODEL = process.env.OPENROUTER_VLM_MODEL || 'anthropic/claude-haiku-5.5';
+const OPENROUTER_MODEL = process.env.OPENROUTER_VLM_MODEL || 'google/gemini-2.5-flash';
 const OPENROUTER_ASSISTANT_MODEL =
   process.env.OPENROUTER_ASSISTANT_MODEL || 'anthropic/claude-haiku-5.5';
 const OPENROUTER_STT_MODEL = process.env.OPENROUTER_STT_MODEL || 'openai/gpt-audio';

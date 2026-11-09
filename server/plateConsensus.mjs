@@ -82,9 +82,11 @@ export function consensusPlate(frames) {
   const agreement = winner.votes / total;
   const confidence = Math.round(Math.min(0.99, 0.65 * agreement + 0.35 * winner.confidence) * 100) / 100;
 
-  // Auto-accept rules: clear majority, or a single strong reading
+  // Auto-accept rules: clear majority, or any valid single reading.
+  // Gate only sends one frame now, so a readable plate must pass immediately
+  // instead of waiting for a second/third confirmation.
   const hasMajority = winner.votes >= 2 && agreement >= 0.5;
-  const strongSingle = total === 1 && winner.confidence >= 0.85;
+  const strongSingle = total === 1 && isValidIdPlate(winner.plate);
   const accepted = (hasMajority || strongSingle) && isValidIdPlate(winner.plate);
 
   let plate = winner.plate;
