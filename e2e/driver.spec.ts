@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { ADMIN_URL, API_URL, DRIVER_URL, seedTokens } from './helpers';
+import { ADMIN_URL, API_URL, DRIVER_URL, gateHeaders, seedTokens } from './helpers';
 
 test('booking dari aplikasi driver muncul di dashboard admin lalu dibatalkan', async ({
   page,
@@ -89,6 +89,88 @@ test('tombol reset tiket terlihat di mobile dan mengembalikan ke halaman cari pa
         data: { sessionCode },
         failOnStatusCode: false,
       });
+    }
+  }
+});
+
+test('tombol konfirmasi zona membuka kamera pemindai QR di mobile', async ({ page, request }) => {
+  let sessionCode = '';
+  let zoneId = '';
+
+  try {
+    const zonesRes = await request.get(`${API_URL}/api/zones`);
+    const zonesBody = await zonesRes.json();
+    const zone = (zonesBody.zones || []).find((z: any) => z.available > 0);
+    expect(zone).toBeTruthy();
+    zoneId = zone.id;
+
+    const eta = new Date(Date.now() + 10 * 60 * 1000).toTimeString().slice(0, 5);
+    const bookingRes = await request.post(`${API_URL}/api/bookings`, {
+      data: {
+        domainId: zone.domainId,
+        zoneId: zone.id,
+        userName: 'E2E Scanner',
+        vehicleType: zone.vehicleType || 'motorcycle',
+        eta,
+      },
+    });
+    const booking = await bookingRes.json();
+    sessionCode = booking.session.sessionCode;
+
+    const entryRes = await request.post(`${API_URL}/api/gates/entry`, {
+      headers: gateHeaders(),
+      data: { sessionCode, manualPlateOverride: 'B 1234 ABC' },
+    });
+    const entry = await entryRes.json();
+    expect(entry.session.status).toBe('ENTERED');
+
+    await page.addInitScript((session) => {
+      localStorage.setItem('smart_parking_driver_real_session', JSON.stringify(session));
+    }, entry.session);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(DRIVER_URL);
+    await page.getByRole('button', { name: 'Tiket saya' }).click();
+
+    await expect(page.locator('.page-nav-title')).toHaveText('Sesi berjalan');
+    const scanButton = page.getByRole('button', { name: 'Pindai QR zona untuk konfirmasi' });
+    await expect(scanButton).toBeVisible();
+    await scanButton.click();
+
+    await expect(page.locator('.zone-scanner-card')).toBeVisible();
+    await expect(page.locator('.zone-scanner-video video')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Tutup' }).click();
+    await expect(page.locator('.zone-scanner-card')).toBeHidden();
+  } finally {
+    if (sessionCode) {
+      // Complete the session so the test does not leave an active entry behind.
+      await request.post(`${API_URL}/api/zones/scan`, {
+        data: { sessionCode, scannedZoneId: zoneId, action: 'confirm_park' },
+        failOnStatusCode: false,
+      });
+      await request.post(`${API_URL}/api/payments/checkout`, {
+        data: { sessionCode },
+        failOnStatusCode: false,
+      });
+      const payRes = await request.post(`${API_URL}/api/payments/pay`, {
+        data: { sessionCode, paymentMethod: 'QRIS' },
+        failOnStatusCode: false,
+      });
+      const payBody = await payRes.json().catch(() => null);
+      const exitCode = payBody?.session?.exitCode;
+      if (exitCode) {
+        await request.post(`${API_URL}/api/gates/exit`, {
+          headers: gateHeaders(),
+          data: { exitCode, manualPlateOverride: 'B 1234 ABC' },
+          failOnStatusCode: false,
+        });
+      } else {
+        await request.post(`${API_URL}/api/bookings/cancel`, {
+          data: { sessionCode },
+          failOnStatusCode: false,
+        });
+      }
     }
   }
 });

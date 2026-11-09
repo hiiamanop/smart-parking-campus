@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
+import jsQR from 'jsqr';
 
 interface Domain {
   id: string;
@@ -140,6 +141,166 @@ function SwipeToGoHome({ onComplete, loading }: { onComplete: () => void; loadin
           <span aria-hidden="true">{loading ? '…' : '→'}</span>
         </button>
         <span className="swipe-track-end" aria-hidden="true">Pulang</span>
+      </div>
+    </div>
+  );
+}
+
+// Full-screen camera scanner for the zone QR posted at each parking pillar.
+function ZoneQrScanner({
+  onDetected,
+  onClose,
+}: {
+  onDetected: (value: string) => void;
+  onClose: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const rafRef = useRef<number>(0);
+  const [error, setError] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
+  const onDetectedRef = useRef(onDetected);
+
+  useEffect(() => {
+    onDetectedRef.current = onDetected;
+  }, [onDetected]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const stop = () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = 0;
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    };
+
+    const scan = () => {
+      if (cancelled) return;
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (video && canvas && video.readyState >= 2 && video.videoWidth) {
+        const scale = Math.min(1, 640 / video.videoWidth);
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const qr = jsQR(image.data, image.width, image.height, {
+            inversionAttempts: 'attemptBoth',
+          });
+          if (qr?.data?.trim()) {
+            const value = qr.data.trim();
+            cancelled = true;
+            stop();
+            onDetectedRef.current(value);
+            return;
+          }
+        }
+      }
+      rafRef.current = requestAnimationFrame(scan);
+    };
+
+    const start = async () => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setError('Kamera tidak didukung browser ini. Ketik kode zona secara manual.');
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        streamRef.current = stream;
+        const video = videoRef.current;
+        if (!video) return;
+        video.srcObject = stream;
+        await video.play();
+        setReady(true);
+        rafRef.current = requestAnimationFrame(scan);
+      } catch (err: any) {
+        const name = err?.name || '';
+        setError(
+          name === 'NotAllowedError' || name === 'PermissionDeniedError'
+            ? 'Izin kamera ditolak. Aktifkan izin kamera di browser, lalu coba lagi.'
+            : name === 'NotFoundError' || name === 'DevicesNotFoundError'
+            ? 'Tidak ada kamera terdeteksi. Ketik kode zona secara manual.'
+            : `Kamera tidak dapat dibuka (${name || 'unknown'}). Ketik kode zona secara manual.`
+        );
+      }
+    };
+
+    start();
+    return () => {
+      cancelled = true;
+      stop();
+    };
+  }, []);
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0);
+        const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const qr = jsQR(image.data, image.width, image.height, {
+          inversionAttempts: 'attemptBoth',
+        });
+        if (qr?.data?.trim()) {
+          onDetectedRef.current(qr.data.trim());
+          URL.revokeObjectURL(url);
+          return;
+        }
+      }
+      URL.revokeObjectURL(url);
+      setError('QR tidak ditemukan di foto. Coba foto ulang dengan QR lebih jelas.');
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      setError('Gagal membaca file gambar.');
+    };
+    img.src = url;
+  };
+
+  return (
+    <div className="zone-scanner-backdrop" role="dialog" aria-modal="true" aria-label="Pindai QR zona">
+      <div className="zone-scanner-card">
+        <div className="zone-scanner-head">
+          <div>
+            <strong>Pindai QR zona</strong>
+            <p>Arahkan kamera ke QR yang tertempel di tiang zona.</p>
+          </div>
+          <button type="button" className="icon-close" onClick={onClose}>
+            Tutup
+          </button>
+        </div>
+
+        <div className="zone-scanner-video">
+          <video ref={videoRef} playsInline muted />
+          <canvas ref={canvasRef} className="zone-scanner-canvas" />
+          {!ready && !error && <div className="zone-scanner-overlay">Mengaktifkan kamera…</div>}
+          <div className="zone-scanner-frame" aria-hidden="true" />
+        </div>
+
+        {error && <div className="alert-message err">{error}</div>}
+
+        <label className="zone-scanner-upload">
+          Unggah foto QR
+          <input type="file" accept="image/*" onChange={handleFile} />
+        </label>
       </div>
     </div>
   );
@@ -646,6 +807,7 @@ function TimelineTicketView({
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [zoneQr, setZoneQr] = useState('');
+  const [scannerOpen, setScannerOpen] = useState(false);
   const [changeZoneId, setChangeZoneId] = useState('');
   const [nowMs, setNowMs] = useState(Date.now());
 
@@ -1067,19 +1229,6 @@ function TimelineTicketView({
         </div>
       </dl>
 
-      {activeSession.status === 'ENTERED' && (
-        <label className="field-label">
-          Kode QR zona yang dipindai
-          <input
-            className="time-input"
-            type="text"
-            placeholder="CAMPUS-ZONE-…"
-            value={zoneQr}
-            onChange={(e) => setZoneQr(e.target.value)}
-          />
-        </label>
-      )}
-
       {canChangeZone && (
         <div className="zone-change-box">
           <div className="zone-change-title">Salah pilih zona?</div>
@@ -1118,14 +1267,71 @@ function TimelineTicketView({
       )}
 
       {activeSession.status === 'ENTERED' && (
-        <div>
+        <div className="zone-confirm-box">
+          <div className="zone-confirm-title">Konfirmasi tiba di zona</div>
           <p className="action-hint">
-            Tempelkan QR tiang zona ke kamera. Sesi ini hanya sah di zona tujuan Anda.
+            Pindai QR yang tertempel di tiang zona. Tombol konfirmasi membuka kamera bila QR belum terbaca.
           </p>
-          <button type="button" className="btn-primary-block" disabled={loading} onClick={() => handleZoneAction('confirm_park')}>
-            {loading ? 'Memproses…' : 'Konfirmasi tiba di zona'}
+
+          {zoneQr.trim() ? (
+            <div className="zone-qr-detected">
+              <span className="zone-qr-detected-label">QR zona terdeteksi</span>
+              <span className="zone-qr-detected-value">{zoneQr.trim()}</span>
+            </div>
+          ) : null}
+
+          <button
+            type="button"
+            className="btn-primary-block"
+            disabled={loading}
+            onClick={() => {
+              if (!zoneQr.trim()) {
+                setStatusMsg(null);
+                setScannerOpen(true);
+                return;
+              }
+              handleZoneAction('confirm_park');
+            }}
+          >
+            {loading
+              ? 'Memproses…'
+              : zoneQr.trim()
+              ? 'Konfirmasi tiba di zona'
+              : 'Pindai QR zona untuk konfirmasi'}
           </button>
+
+          {zoneQr.trim() ? (
+            <button
+              type="button"
+              className="link-action zone-rescan"
+              onClick={() => setScannerOpen(true)}
+            >
+              Pindai ulang QR zona
+            </button>
+          ) : null}
+
+          <details className="manual-zone">
+            <summary>Atau masukkan kode zona manual</summary>
+            <input
+              className="time-input"
+              type="text"
+              placeholder="CAMPUS-ZONE-…"
+              value={zoneQr}
+              onChange={(e) => setZoneQr(e.target.value)}
+            />
+          </details>
         </div>
+      )}
+
+      {scannerOpen && (
+        <ZoneQrScanner
+          onDetected={(value) => {
+            setZoneQr(value.trim());
+            setScannerOpen(false);
+            setStatusMsg({ ok: true, text: 'QR zona terbaca. Tekan konfirmasi tiba di zona.' });
+          }}
+          onClose={() => setScannerOpen(false)}
+        />
       )}
 
       {activeSession.status === 'PARKED_CONFIRMED' && (

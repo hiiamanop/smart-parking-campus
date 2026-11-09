@@ -26,3 +26,7 @@ export async function seedTokens(page: Page) {
 export function adminHeaders(): Record<string, string> {
   return ADMIN_TOKEN ? { Authorization: `Bearer ${ADMIN_TOKEN}` } : {};
 }
+
+export function gateHeaders(): Record<string, string> {
+  return GATE_TOKEN ? { Authorization: `Bearer ${GATE_TOKEN}` } : {};
+}
