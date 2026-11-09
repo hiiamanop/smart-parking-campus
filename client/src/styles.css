@@ -337,6 +337,29 @@ button { font: inherit; }
 .btn-primary-block:hover { background: var(--navy-deep); }
 .btn-primary-block:disabled { opacity: 0.5; cursor: not-allowed; }
 
+.btn-danger-block {
+  width: 100%;
+  background: var(--paper);
+  border: 1px solid #e6b8b2;
+  color: var(--err);
+  font-size: 13.5px;
+  font-weight: 650;
+  padding: 12px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.btn-danger-block:hover { background: #fdf3f2; }
+.btn-danger-block:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.ticket-reset { margin-top: 18px; }
+.ticket-reset-hint {
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: var(--faint);
+  line-height: 1.45;
+  text-align: center;
+}
+
 .icon-nav {
   background: transparent;
   border: none;

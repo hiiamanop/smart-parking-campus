@@ -208,7 +208,11 @@ export function App() {
             updateSession(null);
             return;
           }
-          if (res.session.status === 'COMPLETED' || res.session.status === 'EXPIRED') {
+          if (
+            res.session.status === 'COMPLETED' ||
+            res.session.status === 'EXPIRED' ||
+            res.session.status === 'CANCELLED'
+          ) {
             updateSession(null);
           } else {
             updateSession(res.session);
@@ -253,12 +257,20 @@ export function App() {
               .then((r) => r.json())
               .then((res) => {
                 if (res.ok && res.session) {
-                  if (res.session.status === 'COMPLETED') {
-                    setExitNotice('Kendaraan tercatat keluar. Tiket ditutup.');
+                  if (
+                    res.session.status === 'COMPLETED' ||
+                    res.session.status === 'EXPIRED' ||
+                    res.session.status === 'CANCELLED'
+                  ) {
+                    setExitNotice(
+                      res.session.status === 'COMPLETED'
+                        ? 'Kendaraan tercatat keluar. Tiket ditutup.'
+                        : null
+                    );
                     setTimeout(() => {
                       updateSession(null);
                       setExitNotice(null);
-                    }, 2500);
+                    }, res.session.status === 'COMPLETED' ? 2500 : 0);
                   } else {
                     updateSession(res.session);
                   }
@@ -787,6 +799,73 @@ function TimelineTicketView({
     }
   };
 
+  // Reset darurat: lepaskan tiket dari perangkat ini. Untuk booking yang belum
+  // masuk gate, batalkan juga di server supaya slot langsung tersedia lagi.
+  const handleResetTicket = async () => {
+    if (!activeSession) {
+      onUpdateSession(null);
+      onGoToExplore();
+      return;
+    }
+
+    const isBooked = activeSession.status === 'BOOKED';
+    const confirmed = confirm(
+      isBooked
+        ? 'Reset tiket ini? Booking akan dibatalkan dan slot dilepas.'
+        : 'Reset tiket dari perangkat ini? Sesi di server tetap tercatat sampai kendaraan keluar gate.'
+    );
+    if (!confirmed) return;
+
+    setLoading(true);
+    setStatusMsg(null);
+
+    if (!isBooked) {
+      onUpdateSession(null);
+      setLoading(false);
+      onGoToExplore();
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/bookings/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionCode: activeSession.sessionCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Gagal membatalkan booking');
+      onUpdateSession(null);
+      onGoToExplore();
+    } catch (e: any) {
+      // Tetap izinkan reset lokal walau server gagal, dengan peringatan jelas.
+      onUpdateSession(null);
+      window.alert(
+        `Tiket di perangkat sudah direset, tetapi pembatalan di server gagal: ${
+          e.message || String(e)
+        }. Slot mungkin masih tertahan; hubungi petugas bila perlu.`
+      );
+      onGoToExplore();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const renderResetControl = () => (
+    <div className="ticket-reset">
+      <button
+        type="button"
+        className="btn-danger-block"
+        onClick={handleResetTicket}
+        disabled={loading}
+      >
+        {loading ? 'Mereset…' : 'Reset tiket'}
+      </button>
+      <p className="ticket-reset-hint">
+        Pakai bila QR tidak bisa dipakai atau tiket macet di perangkat ini.
+      </p>
+    </div>
+  );
+
   const handleReissueExit = async () => {
     if (!activeSession) return;
     setLoading(true);
@@ -897,6 +976,8 @@ function TimelineTicketView({
         <div className="note-box">
           <strong>Di gate masuk.</strong> Tempelkan QR ke pemindai. Kamera membaca plat kendaraan, lalu palang terbuka otomatis.
         </div>
+
+        {renderResetControl()}
       </div>
     );
   }
@@ -1072,6 +1153,8 @@ function TimelineTicketView({
           </div>
         </div>
       )}
+
+      {renderResetControl()}
     </div>
   );
 }
